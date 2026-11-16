@@ -24,6 +24,7 @@ preset 的配置错误**不会"少个工具"，而是整个 preset 加载不出�
   4. agentPreset / allowedAgentPresets 引用的 id 在本文件里存在
   5. 几个关键能力开关（executor 有 bash 无 subagent；双方 write/edit 关）
 """
+import io
 import os
 import re
 import subprocess
@@ -31,6 +32,12 @@ import sys
 from pathlib import Path
 
 import yaml
+
+# Windows 控制台默认 GBK，打印 ✅ / ✗ 会 UnicodeEncodeError 把测试判成失败。
+try:
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+except (AttributeError, ValueError):
+    pass
 
 ROOT = Path(__file__).resolve().parent.parent
 PRESET = ROOT / "preset" / "cordis.patch.yml"

@@ -25,9 +25,16 @@
     它自己有 71 个测试，那些测试跟本工作区无关，不在这里跑。
   · preset 的 YAML —— 用 `verify_preset.py` 单独验证（它要读 DSH 的插件目录）。
 """
+import io
 import subprocess
 import sys
 from pathlib import Path
+
+# Windows 控制台默认 GBK，打印 ✅ / ✗ 会 UnicodeEncodeError 中断汇总。
+try:
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+except (AttributeError, ValueError):
+    pass
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
