@@ -2,10 +2,10 @@
 """本地 Web 测试台（v2）：测试会话时间线 + 知识库编辑。
 零依赖：Python 标准库 http.server。
 
-启动:  python webui.py [--port 8900] [--host 0.0.0.0]
-默认绑定 0.0.0.0（内网可访问），启动时打印本机内网 IP。
-访问:  http://<本机内网IP>:8900
-⚠️ 无鉴权，仅限可信内网使用；可用 --host 127.0.0.1 退回仅本机。
+启动:  python webui.py [--port 8900] [--host 127.0.0.1]
+默认只绑 127.0.0.1（本机可访问）。要让同网段别的机器看，显式加
+`--host 0.0.0.0` —— Web UI **无鉴权**，删除记录 / 改写知识卡 / 编辑用例
+这些接口同网段任意可调，仅限可信内网短时使用。
 """
 from __future__ import annotations
 
@@ -1214,9 +1214,9 @@ def _lan_ip() -> str:
 def main():
     ap = argparse.ArgumentParser(description="Android AI 测试台")
     ap.add_argument("--port", type=int, default=8900)
-    ap.add_argument("--host", default="0.0.0.0",
-                    help="监听地址，默认 0.0.0.0（内网可访问）；"
-                         "用 --host 127.0.0.1 可退回仅本机")
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="监听地址，默认 127.0.0.1（仅本机）；"
+                         "要让内网别的机器访问用 --host 0.0.0.0（无鉴权，慎用）")
     args = ap.parse_args()
     if args.host not in ("127.0.0.1", "localhost", "::1"):
         print("⚠️ 警告：绑定非回环地址——Web UI 无鉴权，"
