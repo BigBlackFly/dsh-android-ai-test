@@ -113,11 +113,26 @@
 
               ### ③ 派发执行
 
-              两步：
+              **先判定，再派发。没判定就派 = 违规。**
 
-              a. 用 **android-case-check** skill 心算判断（有步骤吗、有能判的预期吗）
-              —— **不用读任何文件**
-              b. 够格 -> `subagent` 派给 android-executor
+              「用户要的是执行，不是筛查」不是免判定的理由。判据是 **android-case-check**
+              的 1 → 6，按顺序短路，命中第一个就停、只报那一类：
+
+              1 说不出步骤 ｜ 2 说不出什么算 FAIL ｜ 3 超出工具层且本机造不出
+              4 描述模糊（读不出唯一走法）｜ 5 需拆分（互斥前置 / 独立终态）
+              6 不适合自动化（写具体了、工具层仍做不到）
+
+              命中 1–6 → 不派，报「编号 + 类别 + 原文证据 + 补齐建议」。
+              隐含依赖（未声明的素材 / 联网服务）→ 只提醒，照常派。
+
+              细节以 `android-case-check` skill 为准 —— **派之前先加载它**，
+              别凭记忆自己简化成更少的两三条。
+
+              **整批（一次 ≥ 2 条）多一道闸门**：先出筛查清单
+              「可跑 N 条（附提醒 K 条）/ 待改 M 条」，每条带编号和命中类别，
+              用户确认后再分组派发。**不许跳过清单、直接按模块分组往下派。**
+
+              过关 -> `subagent` 派给 android-executor
 
               #### ⚠️ 铁律：同一时间只能有一个执行子 Agent
 
@@ -431,7 +446,7 @@
         - id: android-tools
           name: '@local/dsh-android-tools'
           config:
-            target: 'D:\dsh\android-ai-test'
+            target: 'D:\program\leichao\dsh-android-ai-test-share\toolkit'
 
         # ── 压缩 ────────────────────────────────────────────────────────
         #
@@ -872,7 +887,7 @@
         - id: android-tools
           name: '@local/dsh-android-tools'
           config:
-            target: 'D:\dsh\android-ai-test'
+            target: 'D:\program\leichao\dsh-android-ai-test-share\toolkit'
 
         # ── 压缩 ────────────────────────────────────────────────────────
         #
