@@ -77,4 +77,4 @@ dependency，`pnpm install` 对它们无事可做）；preset 不 import 任何�
 `skills/android-case-check/SKILL.md` 是主 Agent 判断用例够不够格跑。
 改它们**不用重启 DSH**；改 `plugins/` 下的东西要重启（或热重载）。
 
-`toolkit/` 里的实现细节看 `toolkit/docs/`：环境与工具 / 执行参考 / 知识卡与路径图。
+`toolkit/` 里的实现细节看 `toolkit/docs/`：环境与工具 / 执行参考 / 知识卡与视觉通道。

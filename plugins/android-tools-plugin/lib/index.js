@@ -407,12 +407,12 @@ export function apply(ctx, config = {}) {
     defineTool({
       name: 'android_read_file',
       description:
-        '读知识卡 / 路径卡 / 用例文件（UTF-8，永不乱码）。**强烈建议用 card 参数**：一次同时搜知识卡（坑与行为规律）和路径卡（activity 与认出条件）。也可以用 path 读单个文件：默认给章节目录，query 做自然语言检索，section 按章节读，grep 精确匹配，offset/limit 按行读。',
+        '读知识卡 / 用例文件（UTF-8，永不乱码）。**强烈建议用 card 参数**：按包名搜该应用的知识卡（坑与行为规律）。也可以用 path 读单个文件：默认给章节目录，query 做自然语言检索，section 按章节读，grep 精确匹配，offset/limit 按行读。',
       parameters: {
         card: {
           type: 'string',
           description:
-            '应用包名，如 com.zui.calendar。**推荐用法**：一次同时搜 assets/knowledge/<包名>.md（知识卡）和 assets/knowledge/paths/<包名>.md（路径卡），结果按来源标注。用这个就不用记两条路径',
+            '应用包名，如 com.zui.calendar。**推荐用法**：直接搜 assets/knowledge/<包名>.md（知识卡），不用记文件路径',
         },
         path: {
           type: 'string',
