@@ -8,7 +8,8 @@ from __future__ import annotations
 import argparse
 
 from common import (add_common_args, apply_stdin_args, backfill_package, capture, connect, emit,
-                    evidence_paths, fail, guard_terminated, log_auto, next_targets, labeled_nodes, npm_identity,
+                    evidence_paths, fail, guard_terminated, log_auto, next_targets, labeled_nodes,
+                    npm_identity, screen_view, filtered_sig,
                     rel, summarize_xml, texts_payload)
 import time
 from datetime import datetime
@@ -58,7 +59,8 @@ def main() -> None:
     # 和 act 一样带**屏幕身份签名** —— 自动整理路径边时要靠它判"这一步在哪个节点"。
     # ⚠️ observe 也必须带：会话开头往往先 observe（还没有 act），
     # 若它没签名，第一条边的前溯就落空，源节点只能退回裸 activity（真实缺陷）。
-    info = {**info, "sig": npm_identity(
+    # filtered_sig 内部会在"按前台包过滤后为空"时回退不过滤（同 screen_view 的理由）。
+    info = {**info, "sig": filtered_sig(
         xml.read_text(encoding="utf-8"),
         None if getattr(args, "no_filter", False) else info.get("package"))}
 
@@ -103,12 +105,14 @@ def main() -> None:
                  info, crash.get("log_path"))
 
     backfill_package(info.get("package"))
-    _texts: list = []
-    nodes = summarize_xml(xml.read_text(encoding="utf-8"),
-                          mode="full" if getattr(args, "full", False) else "nav",
-                          fg_package=None if getattr(args, "no_filter", False)
-                          else info.get("package"),
-                          texts_out=_texts)
+    # 一屏四件一起取：nodes / 不可点文字 / 可点清单 / 签名，**共用过滤回退**。
+    # 走 screen_view 的理由见 common.py 里它的 docstring（过滤会把模态弹窗整屏滤空）。
+    _view = screen_view(xml.read_text(encoding="utf-8"),
+                        mode="full" if getattr(args, "full", False) else "nav",
+                        fg_package=None if getattr(args, "no_filter", False)
+                        else info.get("package"))
+    nodes = _view["nodes"]
+    _texts = _view["texts"]
     # 知识卡浮现：`start` 时若还不知道包名，由首个 observe 补上（只提示一次）
     k_hint = None
     try:
@@ -128,9 +132,7 @@ def main() -> None:
     payload = {
         **info,
         "evidence": {"png": str(png), "xml": str(xml), "meta": str(meta)},
-        "next": next_targets(nodes, labeled=labeled_nodes(   # 精简可点清单（与 act 一致）
-            xml.read_text(encoding="utf-8"),
-            None if getattr(args, "no_filter", False) else info.get("package"))),
+        "next": _view["next"],          # 精简可点清单（与 act 一致）
         "nodes": nodes,
         "nodes_count": len(nodes),
         "nodes_mode": "full" if getattr(args, "full", False) else "nav",
@@ -140,6 +142,13 @@ def main() -> None:
                  "判断「某字段/某功能在不在」看 texts 或 nodes，**不要用 next 有没有**。"
                  "texts_more>0 表示还有更多文字没给 —— 要看全就 full=true"),
     }
+    if _view["filter_fallback"]:
+        # 同 act：过滤回退要显式告知，否则 AI 会在"看不见"的屏幕上判「功能不存在」
+        payload["filter_fallback"] = _view["filter_fallback"]
+        payload["filter_fallback_hint"] = (
+            "⚠️ 本屏按前台包过滤后为空，已自动改为不过滤（nodes 含其它包的节点）。"
+            "说明屏幕主体不属于前台 App：权限弹窗/桌面引导浮层/通知栏都会这样。"
+            "看 texts 和 nodes 判断实际内容，别因为 filter 不符就判「功能不存在」。")
     # sig / timing 只落盘、不回传给 AI（同 act.py 的理由）：timing 由 capture()
     # 注入到 info，sig 在 L69 加进 info，两者都已随 log_auto 落库。
     payload.pop("sig", None)

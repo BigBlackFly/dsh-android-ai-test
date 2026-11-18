@@ -17,8 +17,9 @@ import re
 import sys
 from pathlib import Path
 
-from common import (emit, find_case_file_by_ref, knowledge_hint,
-                    resolve_case_stem, steps_hint)
+from common import (case_expectations, emit, find_case_file_by_ref,
+                    knowledge_hint, match_expect_id, resolve_case_stem,
+                    steps_hint)
 import sqlite3
 from db import (  # noqa: I001
     INTERIM, STATUSES, SessionDB, clear_current, current_session, get_db,
@@ -203,6 +204,36 @@ def _case_stem_of(row: dict) -> str | None:
     """一条会话记录对应的用例 md 文件名；对不上返回 None。"""
     return resolve_case_stem(row.get("package") or "", row.get("title"),
                              row.get("user_input"))
+
+
+def _resolve_expect_id(db, session_id: int, expect_text: str,
+                        explicit: int | None = None,
+                        explicit_label: str | None = None) -> tuple[int | None, str | None]:
+    """把一条断言的 `expect` 对到用例原文的**第几条预期**（expect_id, expect_label）。
+
+    ## 为什么要自动反推
+
+    `expect_id` 如果是纯可选参数，实际没人传 —— AI 记断言时想的是"把看到
+    的写下来"，不会先去数第几条。结果字段永远 NULL，跨轮比对仍然做不了。
+    所以这里**从会话原文反推**：`sessions.user_input` 存着用例 md 全文
+    （`start --case 176` 时写入），解析出预期清单，再拿这条 expect 去对。
+
+    对不上就返回 `(None, None)`，字段留空 —— 不猜、不硬塞一个编号
+    （塞错会让"预期3 抖动"这种查询出现假阳性，比没有更糟）。
+
+    显式传了 `explicit` 就优先用它（AI 自己想写时仍可覆盖）。
+    """
+    if explicit is not None:
+        return explicit, (explicit_label or str(explicit))
+    try:
+        row = db.get_session(session_id) or {}
+    except Exception:  # noqa: BLE001
+        return None, None
+    exps = case_expectations(row.get("user_input"))
+    hit = match_expect_id(exps, expect_text)
+    if not hit:
+        return None, None
+    return hit["id"], hit["label"]
 
 
 def export_steps(db, session_id: int) -> str | None:
@@ -493,6 +524,10 @@ def main() -> None:
     s.add_argument("--note", default="")
     s.add_argument("--event-id", action="append", type=int, default=[],
                    help="关联本会话证据事件；可重复传入多个事件 ID")
+    s.add_argument("--expect-id", type=int, default=None, dest="expect_id",
+                   help="这条断言对应用例原文的第几条预期（1 起）。**通常不用传**："
+                        "不给就会拿 expect 文本自动去对用例原文；"
+                        "只有自动对不上、而你确定是第几条时才手填")
     s.add_argument("--id", type=int, default=None,
                    help="记录到指定会话（不给就记到当前会话）")
 
@@ -562,6 +597,23 @@ def main() -> None:
                    help='作废原因（必填，写进 summary，如 --reason "title 写错重开"）')
     a.add_argument("--device", default=None, help="（兼容用，收下忽略）")
 
+    # reap：批量回收"僵尸会话"（status 还是 running，但早就没人动了）。
+    #
+    # 为什么必须有：start 的防重复检查只有拦截、没有出口。
+    # 实测 2026-11-17 连续三次被残留会话堵住（#1000216/#1000217/#1000218，
+    # 都是子 Agent 被中途停止留下的），每次都要人工 abandon 才能继续。
+    # 根因不在工具，而在"没有自动收尸机制"。
+    r = sub.add_parser("reap",
+                       help="回收僵尸会话：把长时间无新事件的 running 会话"
+                            "按 ERROR 收尾（不算用例结论）")
+    r.add_argument("--idle-min", type=float, default=60.0, dest="idle_min",
+                   help="多久没有新事件算僵尸（分钟，默认 60）。"
+                        "实测正常跑测试时事件间隔 P99.5 只有 2.4 分钟，60 分钟极安全")
+    r.add_argument("--id", type=int, default=None,
+                   help="只处理指定会话（仍受 --idle-min 约束）")
+    r.add_argument("--dry-run", action="store_true", dest="dry_run",
+                   help="只列出会被回收的会话，不动库")
+
     args = p.parse_args()
 
     if args.cmd not in _READ_ONLY_CMDS:
@@ -609,11 +661,26 @@ def main() -> None:
                 if _s and str(_s.get("status")) == "running":
                     _nev = len(_s.get("events") or [])
                     _age = str(_s.get("started_at") or "")[:19]
+                    _last = (_s.get("events") or [{}])[-1].get("created_at") or _age
+                    _idle = ""
+                    try:
+                        from datetime import datetime as _dt
+                        _m = (_dt.now() - _dt.fromisoformat(str(_last)[:19])).total_seconds() / 60
+                        if _m >= 10:
+                            _idle = f"\n  最后活动 {str(_last)[:19]}（已有 {_m:.0f} 分钟没有新事件）"
+                    except (ValueError, TypeError):
+                        pass
                     raise SystemExit(
                         f"已有运行中的会话 #{_cur}「{_s.get('title') or ''}」\n"
-                        f"  开始 {_age}    已记 {_nev} 个事件\n"
+                        f"  开始 {_age}    已记 {_nev} 个事件{_idle}\n"
                         f"\n"
                         f"  继续跑 → 直接用现有会话，不要再 start\n"
+                        f"\n"
+                        f"  这条其实已经没人管了（子 Agent 被停止 / 进程被杀会这样）：\n"
+                        f"    session.py reap --dry-run\n"
+                        f"        （列出所有 running 但长时间无新事件的会话，不动库）\n"
+                        f"    session.py reap\n"
+                        f"        （按 ERROR 收尾回收，阈值默认 60 分钟；不算用例结论）\n"
                         f"\n"
                         f"  确实要重来（title 写错等），挑一条收尾再 start：\n"
                         f"    session.py abandon --id {_cur} --reason \"重开\"\n"
@@ -762,10 +829,15 @@ def main() -> None:
         sid = args.id if getattr(args, "id", None) else current_session()
         if not sid:
             raise SystemExit("没有进行中的会话，先 session.py start（或用 --id 指定）")
-        fid = db.add_finding(sid, args.status, maybe_file(args.expect),
+        _exp_text = maybe_file(args.expect)
+        _eid, _elab = _resolve_expect_id(db, sid, _exp_text,
+                                          getattr(args, "expect_id", None))
+        fid = db.add_finding(sid, args.status, _exp_text,
                              maybe_file(args.actual), maybe_file(args.note),
-                             event_ids=args.event_id)
-        emit(True, {"finding_id": fid, "evidence_event_ids": args.event_id})
+                             event_ids=args.event_id,
+                             expect_id=_eid, expect_label=_elab)
+        emit(True, {"finding_id": fid, "evidence_event_ids": args.event_id,
+                    "expect_id": _eid, "expect_label": _elab})
     elif args.cmd == "findings-batch":
         # 一次写多条断言。任何一条不合法就整批不写（避免写一半）。
         sid = args.id if getattr(args, "id", None) else current_session()
@@ -792,17 +864,27 @@ def main() -> None:
             if not it.get("expect"):
                 raise SystemExit(f"第 {i} 项缺 expect")
         ids = []
+        _matched = []
         for it in items:
             ev = it.get("event_id") or it.get("event_ids") or []
             if isinstance(ev, int):
                 ev = [ev]
             ids.append([int(x) for x in ev])
-            fid = db.add_finding(sid, it["status"], it.get("expect", ""),
+            _et = it.get("expect", "")
+            _eid, _elab = _resolve_expect_id(db, sid, _et, it.get("expect_id"))
+            fid = db.add_finding(sid, it["status"], _et,
                                  it.get("actual", ""), it.get("note", ""),
-                                 event_ids=ids[-1])
+                                 event_ids=ids[-1],
+                                 expect_id=_eid, expect_label=_elab)
+            _matched.append({"finding_id": fid, "expect_id": _eid,
+                             "expect_label": _elab})
             ids[-1] = fid
+        _unmatched = sum(1 for m in _matched if m["expect_id"] is None)
         emit(True, {"count": len(items), "finding_ids": ids,
-                    "note": "批量写入完成"})
+                    "expects": _matched,
+                    "note": ("批量写入完成" if not _unmatched else
+                             f"批量写入完成；其中 {_unmatched} 条对不上用例原文的预期"
+                             "（expect_id 留空，不影响结论，只是跨轮比对少了这一条）")})
     elif args.cmd == "resume":
         # 用途只有一个：**崩溃终止后人工确认继续**（清除终态，否则工具仍拒绝执行）。
         #
@@ -932,6 +1014,47 @@ def main() -> None:
                              + ("该会话曾被崩溃终止，按规矩落 BLOCKED；"
                                 if final == "BLOCKED" else "进 ERROR 桶；")
                              + "证据目录保留不动")})
+    elif args.cmd == "reap":
+        # 回收僵尸会话：running 但长时间无新事件。
+        #
+        # ⚠️ 落 ERROR 而不是 BLOCKED：BLOCKED 在产品口径里是
+        #    「用例的前置不成立、没机会验证」，是缺陷线索；僵尸会话是
+        #    「这条根本没跑完，而且没人管了」，与 abandon 同桶。
+        #    summary 前缀「自动回收：」让记录自解释 —— 半年后能分清
+        #    这是人作废的还是机器收的。
+        stale = db.stale_sessions(max_idle_min=args.idle_min)
+        if getattr(args, "id", None):
+            stale = [s for s in stale if s["id"] == args.id]
+        if not stale:
+            emit(True, {"reaped": [], "note":
+                        f"没有僵尸会话（阈值 {args.idle_min:g} 分钟内无新事件的 running 会话）"})
+            raise SystemExit(0)
+        if getattr(args, "dry_run", False):
+            emit(True, {"dry_run": True, "would_reap": stale,
+                        "note": f"{len(stale)} 个会话会被回收（--dry-run，未动库）"})
+            raise SystemExit(0)
+        done, failed = [], []
+        cur = current_session()
+        for s in stale:
+            reason = (f"自动回收：{s['idle_min']:g} 分钟无新事件"
+                      f"（阈值 {args.idle_min:g} 分钟），最后活动 {s['last_activity']}，"
+                      f"已记 {s['events']} 个事件")
+            try:
+                # 崩溃终止过的只能落 BLOCKED（finish_session 的规矩）
+                final = "BLOCKED" if s["terminated"] else "ERROR"
+                db.finish_session(s["id"], final, reason)
+            except (ValueError, sqlite3.Error, OSError) as e:  # noqa: PERF203
+                failed.append({"id": s["id"], "error": str(e)})
+                continue
+            if cur == s["id"]:
+                clear_current(s["id"])
+                unpin_record()
+            done.append({"id": s["id"], "status": final,
+                         "idle_min": s["idle_min"], "events": s["events"]})
+        emit(not failed, {"reaped": done, "failed": failed,
+                          "note": (f"回收 {len(done)} 个僵尸会话，进 ERROR 桶，"
+                                   f"不计入用例通过率；证据目录保留不动")
+                                  + (f"；{len(failed)} 个失败" if failed else "")})
     elif args.cmd == "perm-intent":
         sid = args.id if getattr(args, "id", None) else current_session()
         if not sid:

@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import threading
 from datetime import datetime
@@ -45,6 +46,31 @@ from pathlib import Path
 from runtime import CALL_ID, STORAGE_DIR, current_record_dir, recording_issues
 
 ROOT = Path(__file__).resolve().parent.parent
+
+# 「预期1 …」「预期3：…」「步骤2 …」这类前缀。与 common.py 里同名正则同口径
+# —— 不 import common 是为了避免循环依赖（common 在函数内 import db）。
+_EXPECT_PREFIX_RE = re.compile(
+    r"^\s*(?:预期|期望|断言|检查点|步骤|第)\s*\d{1,3}\s*(?:条)?\s*[:：.、,，]?\s*")
+
+
+def _case_key(title: str | None, package: str | None = None) -> str:
+    """把同一用例的不同 title 写法归一到同一个键。
+
+    实测同一份用例在 `sessions.title` 里有 4 种写法（2026-11-18）：
+      `com.zui.calendar_新建课程表_176` / `com.zui.calendar_176`
+      / `日历_176 新建课程表检查` / `新建课程表_176`
+    直接拿 title 当分组键会把同一用例拆成 4 组，跨轮抖动永远凑不齐。
+
+    归一规则：取**用例编号**（`_\\d{2,4}` 末尾）；取不到就退回去掉包名前缀的
+    title 原文。重号（03 有两条）靠"同一句 expect 文本 + 同一 expect_id"再兜一层。
+    """
+    t = (title or "").strip()
+    if package and t.startswith(package):
+        t = t[len(package):].lstrip("_- ").strip()
+    m = re.search(r"[_\-](\d{2,4})(?!\d)", t)
+    if m:
+        return f"{(package or '').strip()}#{m.group(1)}"
+    return f"{(package or '').strip()}#{t}"
 
 # 全局唯一数据库
 DB_FILE = STORAGE_DIR / "test.db"
@@ -126,6 +152,8 @@ CREATE TABLE IF NOT EXISTS findings(
   event_id INTEGER,
   status TEXT,
   expect TEXT,
+  expect_id INTEGER,
+  expect_label TEXT,
   actual TEXT,
   note TEXT,
   created_at TEXT
@@ -184,6 +212,11 @@ class SessionDB:
                          "ALTER TABLE sessions ADD COLUMN perm_intent_at TEXT",
                          "ALTER TABLE sessions ADD COLUMN knowledge_shown INTEGER DEFAULT 0",
                          "ALTER TABLE events ADD COLUMN call_id TEXT",
+                         # 结构化预期编号：#4 起 findings 能对齐"第几条预期"，
+                         # 不再靠凑中文。expect_id 是按位置排的 1..N（机器比对用），
+                         # expect_label 存用例原文写的编号（3-4 / 1~2 原样），仅供人读。
+                         "ALTER TABLE findings ADD COLUMN expect_id INTEGER",
+                         "ALTER TABLE findings ADD COLUMN expect_label TEXT",
                          # 单库化的关键列：这次运行属于哪个 uuid
                          "ALTER TABLE sessions ADD COLUMN run_id TEXT"):
                 try:
@@ -246,7 +279,20 @@ class SessionDB:
 
     def add_finding(self, session_id: int, status: str, expect: str = "",
                     actual: str = "", note: str = "", event_id: int | None = None,
-                    event_ids: list[int] | None = None) -> int:
+                    event_ids: list[int] | None = None,
+                    expect_id: int | None = None,
+                    expect_label: str | None = None) -> int:
+        """记一条断言。
+
+        `expect_id` 是**结构化预期编号**（1..N，按用例「预期结果」段的位置序），
+        `expect_label` 是用例原文写的编号（`3-4`/`1~2` 原样，仅供人读）。
+
+        ⚠️ 为什么加这两个字段：`expect` 是自由中文，同一句预期实测有 4 种写法，
+        机器没法跨轮比对 —— 同一用例跑 7 轮得 6 个 FAIL 1 个 ERROR，到底是产品
+        不稳还是判据漂了，看库里两段不同的中文谁也说不清。有了 expect_id，
+        「预期3 这轮 PASS 下轮 FAIL」可以一句 SQL 查出来（见 `flaky_expects`）。
+        文本仍必填（人要看），编号是**附加**的对齐键，不替代文本。
+        """
         if status not in STATUSES:
             raise ValueError(f"Invalid finding status: {status}")
         ids = list(dict.fromkeys(([event_id] if event_id is not None else []) + (event_ids or [])))
@@ -254,6 +300,8 @@ class SessionDB:
             raise ValueError("Finding actual observation/reason is required")
         if status in ("PASS", "FAIL") and (not ids or not expect.strip()):
             raise ValueError("Verified findings require an expectation and explicit evidence events")
+        if expect_id is not None and (not isinstance(expect_id, int) or expect_id < 1):
+            raise ValueError(f"expect_id must be a positive integer, got {expect_id!r}")
         conn = self._conn()
         with conn:
             session = conn.execute("SELECT status FROM sessions WHERE id=?", (session_id,)).fetchone()
@@ -262,9 +310,10 @@ class SessionDB:
             for eid in ids:
                 self._validate_evidence(conn, session_id, eid)
             cur = self._conn().execute(
-                "INSERT INTO findings (session_id, event_id, status, expect, actual,"
-                " note, created_at) VALUES (?,?,?,?,?,?,?)",
-                (session_id, ids[0] if ids else None, status, expect, actual, note, self._now()))
+                "INSERT INTO findings (session_id, event_id, status, expect, expect_id,"
+                " expect_label, actual, note, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (session_id, ids[0] if ids else None, status, expect, expect_id,
+                 (expect_label or None), actual, note, self._now()))
             fid = cur.lastrowid
             conn.executemany("INSERT INTO finding_events VALUES (?,?)", [(fid, eid) for eid in ids])
             return fid
@@ -528,6 +577,106 @@ class SessionDB:
         except sqlite3.Error:
             return False
 
+    def flaky_expects(self, min_runs: int = 2, limit: int = 50) -> list[dict]:
+        """找出**同一句预期、跨轮结论反了**的断言（抖动）。
+
+        这是 #4（结构化 expect_id）真正的落地价值 —— 没有 expect_id 时这个
+        查询写不出来：只能按 `expect` 中文精确分组，而同一句预期实测有 4 种写法
+        「预期1 打开课程表页面」「预期1：…」「打开课程表页面」「步骤1 打开课程表界面」，
+        分组后每组剩 1 条，看起来每次都"稳定"。
+
+        ## 两级分组（第二级不能省）
+
+        实测（2026-11-18，回填 1446 条存量断言）：
+          · 只按 `(用例, expect_id)` 分组 → 26 组「抖动」
+          · 再按 `(用例, expect_id, 归一化原文)` 分组 → **21 组**
+
+        差出来的 5 组是**合法拆分**，不是抖动：同一个「预期1」被 AI 拆成
+        `预期1（拆分1-a）`/`1-b`/`1-c` 三个断言分别判，文本不同、结论当然可以不同
+        （日历_15 新建-弹框检查就是这种）。把这些算进抖动会让报表天天报假警。
+
+        所以：
+          · `flaky`  —— 同 expect_id + **同一句文本** 既 PASS 又 FAIL → 真抖动，要人看
+          · `variants` —— 同 expect_id 下出现了多种文本 → 判据漂了，是"为什么抖"的线索
+        两者分开返回，不混在一起。
+
+        ## 分组键里的「用例」怎么来
+
+        `sessions.title` 同一用例有 4 种写法（`com.zui.calendar_新建课程表_176` /
+        `com.zui.calendar_176` / `日历_176 …`），直接当键会把同一用例拆成几组，
+        抖动就永远凑不齐。这里按**编号**归一（`_case_key`），重号只在同包内
+        （03 有两条）且还要求 expect 文本一致，可接受。
+        """
+        sql = """
+        SELECT s.title AS title,
+               s.package AS package,
+               f.expect_id AS eid,
+               f.expect AS expect,
+               f.expect_label AS label,
+               f.status AS status,
+               s.id AS sid
+          FROM findings f JOIN sessions s ON s.id = f.session_id
+         WHERE f.status IN ('PASS','FAIL')
+           AND f.expect_id IS NOT NULL
+        """
+        try:
+            rows = self._conn().execute(sql).fetchall()
+        except sqlite3.Error:
+            return []
+
+        def _norm(s: str) -> str:
+            """抹平排版差异（编号前缀/空白/全角标点），**不动文字**。"""
+            s = _EXPECT_PREFIX_RE.sub("", (s or "").strip())
+            s = s.replace("\u3000", "")
+            s = re.sub(r"\s+", "", s)
+            for a, b in (("\u201c", '"'), ("\u201d", '"'), ("\u2018", "'"),
+                         ("\u2019", "'"), ("\uff1b", ";"), ("\uff0c", ","),
+                         ("\uff1a", ":"), ("\u3002", ".")):
+                s = s.replace(a, b)
+            return s
+
+        # (case_key, eid) → 该预期条目的总览
+        broad: dict[tuple, dict] = {}
+        # (case_key, eid, norm_text) → 同一句预期的结论
+        fine: dict[tuple, dict] = {}
+        for r in rows:
+            ck = _case_key(r["title"], r["package"])
+            eid = r["eid"]
+            b = broad.setdefault((ck, eid), {
+                "case": r["title"], "expect_id": eid, "sessions": set(),
+                "pass": 0, "fail": 0, "labels": [], "texts": []})
+            b["sessions"].add(r["sid"])
+            b["pass" if r["status"] == "PASS" else "fail"] += 1
+            if r["label"] and r["label"] not in b["labels"]:
+                b["labels"].append(r["label"])
+            txt = (r["expect"] or "").strip()
+            if txt and txt not in b["texts"] and len(b["texts"]) < 4:
+                b["texts"].append(txt)
+
+            nt = _norm(r["expect"])
+            f = fine.setdefault((ck, eid, nt), {
+                "case": r["title"], "expect_id": eid, "text": txt,
+                "label": r["label"], "sessions": set(), "pass": 0, "fail": 0})
+            f["sessions"].add(r["sid"])
+            f["pass" if r["status"] == "PASS" else "fail"] += 1
+
+        flaky: list[dict] = []
+        for f in fine.values():
+            if f["pass"] and f["fail"] and len(f["sessions"]) >= min_runs:
+                flaky.append({"case": f["case"], "expect_id": f["expect_id"],
+                              "text": f["text"], "label": f["label"],
+                              "sessions": len(f["sessions"]),
+                              "pass": f["pass"], "fail": f["fail"]})
+        variants = [{"case": b["case"], "expect_id": b["expect_id"],
+                     "sessions": len(b["sessions"]), "pass": b["pass"],
+                     "fail": b["fail"], "labels": b["labels"],
+                     "texts": b["texts"]}
+                    for b in broad.values() if len(b["texts"]) > 1]
+
+        flaky.sort(key=lambda x: -(x["pass"] + x["fail"]))
+        variants.sort(key=lambda x: -(x["pass"] + x["fail"]))
+        return {"flaky": flaky[:limit], "variants": variants[:limit]}
+
     def finding_stats(self, session_id: int) -> dict:
         """各结论的断言计数（finish 自检用：有 FAIL 时结论不得 PASS）。"""
         try:
@@ -784,6 +933,72 @@ class SessionDB:
             return {r["k"]: r["n"] for r in rows}
         except sqlite3.Error:
             return {}
+
+    def stale_sessions(self, max_idle_min: float = 60.0) -> list[dict]:
+        """列出**声称还在跑、但早没人动**的会话（僵尸会话）。
+
+        ## 为什么需要这个
+
+        `session.py start` 发现还有 `status='running'` 的会话就拒绝新建。
+        这条防线本身是对的（防同名重复开），但它**没有出口**：
+        子 Agent 被中途停止、或 AI 进程被杀，会话就永远停在 running，
+        设备执行通道被一直占住 —— 实测（2026-11-17）连续撞了三次：
+
+          #1000216 / #1000217 / #1000218 都是「子 Agent 被停止的残留会话」，
+          只能靠人工 `abandon --id N --reason "..."` 一个个收掉
+
+        ## 阈值为什么是 60 分钟
+
+        实测 `storage/test.db` 全部 10547 个相邻事件间隔（2026-11-18）：
+
+          P50 0.20 分 / P90 0.40 分 / P99 1.37 分 / **P99.5 2.43 分**
+          >30 分钟的只有 4 个，>60 分钟的只有 3 个（共 10961 个事件）
+
+        也就是说正常跑测试时，**两次工具调用之间极少超过 3 分钟**
+        （模型思考 + 一次冷启动）。60 分钟是 P99.5 的 25 倍，误杀概率极低；
+        反过来，真僵尸（几小时不动）一定会被收掉。
+
+        ⚠️ 判据是**最后一次事件距今多久**，不是会话总跨度。
+        所以「连续跑了 13 小时、一直在动」的会话（历史上 #83 就是）不会被误判 ——
+        它有事件在刷新 last_activity。
+
+        ## 不改库
+
+        这里只**读**。真要回收得由调用方显式 `finish_session`，
+        因为作废要留 summary 说明，不能静默改状态。
+        """
+        try:
+            rows = self._conn().execute("""
+                SELECT s.id AS id, s.title AS title, s.kind AS kind,
+                       s.started_at AS started_at, s.terminated AS terminated,
+                       (SELECT COUNT(*) FROM events e
+                         WHERE e.session_id = s.id) AS nev,
+                       (SELECT MAX(e.created_at) FROM events e
+                         WHERE e.session_id = s.id) AS last_ev
+                  FROM sessions s
+                 WHERE s.status = 'running'
+                 ORDER BY s.id
+            """).fetchall()
+        except sqlite3.Error:
+            return []
+        now = datetime.now()
+        out = []
+        for r in rows:
+            ref = r["last_ev"] or r["started_at"]
+            try:
+                idle = (now - datetime.fromisoformat(str(ref)[:19])).total_seconds() / 60.0
+            except (ValueError, TypeError):
+                continue          # 时间串坏了就别猜，跳过
+            if idle >= max_idle_min:
+                out.append({"id": r["id"], "title": r["title"] or "",
+                            "kind": r["kind"] or "test",
+                            "started_at": r["started_at"],
+                            "last_activity": ref,
+                            "idle_min": round(idle, 1),
+                            "events": r["nev"],
+                            "terminated": bool(r["terminated"])})
+        out.sort(key=lambda x: -x["idle_min"])
+        return out
 
     def get_session(self, session_id: int) -> dict | None:
         row = self._conn().execute(

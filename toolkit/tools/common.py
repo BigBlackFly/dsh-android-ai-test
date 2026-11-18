@@ -550,6 +550,200 @@ def knowledge_hint(package: str | None, shown: bool = False,
 _CASE_NUM_RE = re.compile(r"[_\-](\d{2,4})(?!\d)")
 
 
+# ---------- 用例「预期」切分 ----------
+#
+# ⚠️ 为什么需要结构化 expect_id（真实痛点，有数据）：
+# findings.expect 原来是纯自由文本。实测 1,766 条里 **1,372 条各不相同** ——
+# 同一句预期被写成「预期1 打开课程表页面」「预期1：打开课程表页面」
+# 「打开课程表页面」「步骤1 打开课程表界面」四种样子，机器完全没法比对。
+# 后果：同一用例跑多轮，结论是可复现性判断不了的那一类 ——
+# 「预期3」这轮 PASS 下轮 FAIL，看库里只是两段不同的中文，谁也说不清
+# 是产品不稳定还是判据漂了（实测 117 的预期3：4 轮里 2 次 PASS 2 次 FAIL，
+# 最后查明是选的主题没有对应 overlay，即"判据本身没定住"）。
+#
+# 解法：把「第几条预期」变成**结构化字段**（findings.expect_id），
+# 文本随便怎么写都能对齐。expect_id 从**用例原文**解析出来，不靠 AI 记。
+#
+# ⚠️ 但原文编号本身不可靠（64 条真实用例实测）：
+#   · 从 2 开始：「恢复应用_119」预期只有 `2.` `3.`
+#   · 从 3 开始：「备注粘贴_146」只有 `3.`
+#   · 重号：「启动应用_03」出现两个 `2.`
+#   · 跳号：「抢火车票2_70」是 1/3/4；「新建生日_29」是 1/2/6
+#   · 区间编号：`3-4.课程表列表名称前方显示多选按钮`、`1~2.弹框为中间布局显示`
+#   · 整句无编号：「widget_128」「设为当前与删除_186」「课程表多选管理_185」
+# 所以 **expect_id 按位置顺序 1..N 编号**，原文写的数字只当**标签留存**，
+# 不参与对齐。这样两种排版（`1.` 起 vs 无编号）都能给出稳定、可比对的 id。
+
+_EXPECT_SECTION_RE = re.compile(r"预期结果?\s*[：:]?")
+_VERIFY_SECTION_RE = re.compile(r"^\s*(验证|预期结果?|预期)\s*[：:]?\s*$")
+# 顶层条目：`1.` `1、` `1．` `3-4.` `1~2.`（编号后空格可有可无）
+_EXPECT_ITEM_RE = re.compile(r"^\s*(\d{1,3}(?:\s*[-~－～]\s*\d{1,3})?)\s*[.．、]\s*")
+# 编号后**无分隔符**的写法：`1调起、收起、切换无异常`（实测「新建弹框_15」）。
+# 收紧两条，避免把正文数字当编号：①只认 1-9（`10个颜色` 不是条目）
+# ②数字后面紧跟的必须是汉字。
+_EXPECT_BARE_NUM_RE = re.compile(r"^\s*([1-9])(?![\d.．、])\s*(?=[\u4e00-\u9fff])")
+
+
+def split_case_expectations(text: str) -> list[dict]:
+    """把用例原文的「预期结果」段切成**有序预期列表**。
+
+    返回 `[{"id": 1, "label": "1", "text": "打开课程表页面"}, ...]`：
+      · `id`    —— 位置序号，1..N，**这才是机器比对用的稳定 id**
+      · `label` —— 原文写的编号（`3-4` / `1~2` 原样保留），仅供人读
+      · `text`  —— 该条预期的全文（含续行，`·` 开头的子项并入上一条）
+
+    识别不了「预期结果」段时返回 `[]`（调用方按"这条用例没有可对齐的预期"处理）。
+
+    ⚠️ 续行合并是**必须**的：176 的预期5 横跨 6 行（`·课程名称…` 等），
+    逐行切会把它拆成 6 条，AI 按"1 预期 = 1 finding"记就会多记 5 条。
+    """
+    if not (text or "").strip():
+        return []
+    lines = text.splitlines()
+    start = None
+    # 两种段头：
+    #   ① 「预期结果」在行内（`预期结果 1. …` 或 `预期结果：`）
+    #   ② 「验证」独占一行（`测试用例 联想日历_185` 那种排版）
+    for i, ln in enumerate(lines):
+        if _EXPECT_SECTION_RE.search(ln):
+            tail = _EXPECT_SECTION_RE.split(ln, maxsplit=1)[-1] if _EXPECT_SECTION_RE.search(ln) else ""
+            start = (i, tail)
+            break
+        if _VERIFY_SECTION_RE.match(ln):
+            start = (i, "")
+            break
+    if start is None:
+        return []
+
+    idx, tail = start
+    chunks: list[list[str]] = []
+    # 段头同行可能直接跟第 1 条（`预期结果 1. 打开课程表页面`）
+    if tail.strip():
+        chunks.append([tail.strip()])
+    for ln in lines[idx + 1:]:
+        s = ln.strip()
+        if not s:
+            continue
+        # 段落结束：遇到下一个段头（操作步骤 / 预置条件 / 分隔线）
+        if re.match(r"^\s*(操作步骤|测试步骤|步骤|预置条件|前提)\s*[：:]?\s*$", s):
+            break
+        if s.startswith("---"):
+            break
+        if _EXPECT_ITEM_RE.match(s) or _EXPECT_BARE_NUM_RE.match(s):
+            chunks.append([s])
+        elif chunks:
+            chunks[-1].append(s)      # 续行（`·课程名称…` / 断行）
+        else:
+            chunks.append([s])        # 整段没有编号时的第一句
+    if not chunks:
+        return []
+
+    out: list[dict] = []
+    for chunk in chunks:
+        head = chunk[0]
+        m = _EXPECT_ITEM_RE.match(head)
+        if m:
+            label = m.group(1).replace(" ", "")
+            body = head[m.end():].strip()
+        else:
+            m2 = _EXPECT_BARE_NUM_RE.match(head)
+            label = m2.group(1) if m2 else ""
+            body = head[m2.end():].strip() if m2 else head.strip()
+        rest = "".join(x for x in chunk[1:])
+        full = (body + rest).strip()
+        if not full:
+            continue
+        out.append({"id": len(out) + 1, "label": label, "text": full})
+    return out
+
+
+def case_expectations(case_md_text: str | None) -> list[dict]:
+    """`split_case_expectations` 的宽容包装：异常/空输入都返回 `[]`。"""
+    try:
+        return split_case_expectations(case_md_text or "")
+    except (re.error, TypeError, ValueError):
+        return []
+
+
+# 「预期1 …」「预期3：…」「步骤2 …」「第 3 条 …」这类前缀，比对前要剥掉
+_EXPECT_PREFIX_RE = re.compile(
+    r"^\s*(?:预期|期望|断言|检查点|步骤|第)\s*(?P<n>\d{1,3})\s*(?:条)?\s*[:：.、,，]?\s*")
+
+
+def _norm_expect(s: str) -> str:
+    """归一化预期文本：抹平空白与全/半角标点，**不动文字内容**。
+
+    只抹平排版差异，这样"改写/丢句子"仍能被识别出来（与 `kb_check` 同口径）。
+    """
+    s = (s or "").replace("\u3000", "")
+    s = re.sub(r"\s+", "", s)
+    for a, b in (("\u201c", '"'), ("\u201d", '"'), ("\u2018", "'"), ("\u2019", "'"),
+                 ("\uff1b", ";"), ("\uff0c", ","), ("\uff1a", ":"), ("\u3002", ".")):
+        s = s.replace(a, b)
+    return s
+
+
+def match_expect_id(expectations: list[dict], expect_text: str) -> dict | None:
+    """把 AI 写的 `expect` 对到用例原文的**第几条预期**。
+
+    返回 `{"id": 3, "label": "3", "match": "exact|label|fuzzy",
+            "text": "<用例原文那一条>"}`；对不上返回 None。
+
+    三级匹配（都做过实测，缺一不可）：
+      ① **编号前缀** —— AI 写「预期3 弹框关闭」「预期3：…」，直接取 3 去对 label。
+         最常见；但**不能只靠它**（AI 会写错号、用例本身编号还可能是 3-4 区间）。
+      ② **归一化全等** —— 文本照抄用例原文，剥掉空白/标点差异后一致。
+      ③ **包含匹配** —— AI 把原文缩写或加了前后缀；取最长命中且要求 ≥6 字，
+         防止「正常」「成功」这类短词误配。
+
+    为什么值得做：不加这一步，`expect_id` 就只是个可选参数，实际没人传（AI
+    不记得），字段永远是 NULL，跨轮比对还是做不了。让它**自动从文本反推**，
+    才能把存量 1766 条断言的写法直接变成可比对的编号。
+    """
+    exps = expectations or []
+    if not exps:
+        return None
+    raw = (expect_text or "").strip()
+    if not raw:
+        return None
+
+    def _hit(e: dict, how: str) -> dict:
+        return {"id": e["id"], "label": e["label"], "match": how, "text": e["text"]}
+
+    # ① 编号前缀
+    m = _EXPECT_PREFIX_RE.match(raw)
+    if m:
+        n = m.group("n")
+        for e in exps:
+            lab = (e["label"] or "").strip()
+            if lab == n or lab.split("-")[0] == lab.split("~")[0] == n:
+                return _hit(e, "label")
+            # 区间编号 `3-4`：n 落在区间内也算
+            rg = re.split(r"[-~－～]", lab)
+            if len(rg) == 2 and rg[0].isdigit() and rg[1].isdigit():
+                if int(rg[0]) <= int(n) <= int(rg[1]):
+                    return _hit(e, "label")
+
+    body = _EXPECT_PREFIX_RE.sub("", raw)
+    nb = _norm_expect(body)
+    # ② 归一化全等
+    for e in exps:
+        if _norm_expect(e["text"]) == nb:
+            return _hit(e, "exact")
+    # ③ 包含匹配：取最长命中
+    best, best_len = None, 0
+    for e in exps:
+        ne = _norm_expect(e["text"])
+        if len(ne) < 6:
+            continue
+        if ne in nb or nb in ne:
+            if len(ne) > best_len:
+                best, best_len = e, len(ne)
+    if best is not None:
+        return _hit(best, "fuzzy")
+    return None
+
+
 def case_stems(package: str | None) -> list[str]:
     """`assets/cases/<包名>/` 下所有用例 md 的文件名（不含 `.md`）。"""
     if not package:
@@ -1456,6 +1650,72 @@ def texts_payload(texts: list) -> dict:
     if len(texts) > TEXTS_CAP:
         out["texts_more"] = len(texts) - TEXTS_CAP
     return out
+
+
+def filtered_sig(xml_text: str, fg_package: str | None) -> list[str]:
+    """算屏幕身份签名，**按前台包算空了就回退不过滤**。
+
+    ⚠️ 为什么需要回退（与 screen_view 同源，真实假阴性）：
+    签名只落库不回传给 AI，但它是会话路径、"这步停在哪一页"、浮层检测的唯一依据。
+    过滤把整屏滤空时签名也会是空列表 —— 那等于这一步没有身份，
+    事后所有依赖"源节点"的整理都会落空。空签名几乎不可能是真的（真空白页也有
+    状态栏/导航栏），所以签名为空就按不过滤再算一次。
+    """
+    sig = npm_identity(xml_text, fg_package)
+    if fg_package and not sig:
+        sig = npm_identity(xml_text, None)
+    return sig
+
+
+def screen_view(xml_text: str, *, mode: str = "nav",
+                fg_package: str | None = None) -> dict:
+    """一屏的完整读法：nodes + 不可点文字 + 可点清单 + 身份签名，**带过滤回退**。
+
+    返回 `{"nodes", "texts", "next", "sig", "filter_fallback"}`。
+
+    ⚠️ 过滤回退为什么必须在工具层做（这是最贵的一类假阴性）：
+    按"前台包"过滤能天然兼容崩溃回落桌面、权限弹窗、跳转图库这些时刻——
+    屏幕上是什么就留什么。但它有一个边界：**屏幕上的内容不属于前台包时**。
+    典型三种：权限弹窗宿主是 permissioncontroller、launcher 引导浮层属于
+    com.zui.launchersdk、通知栏展开后主体是 systemui。这时按前台包过滤会把
+    **整屏滤空**，AI 收到 nodes=[] texts=[] 只能判「什么都没有」。
+
+    实测代价：重放 6098 份历史 dump，112 份（2%）payload 完全为空，
+    其中 11 份是 launcher 页面上明明有「立即体验 / 取消」弹窗却返回空白页
+    （样本：run_history/6f981802-…/evidence/case117/step23_swipe_to_page1/dump.xml，
+    按 launchersdk 过滤有 2 个可点节点，按 launcher 过滤是 0）。
+    AI 在空白页上做出的结论（"没有这个功能"）是不可恢复的错判，所以回退放工具层，
+    不指望 AI 自己想到去加 --no-filter。
+
+    回退不是静默的：`filter_fallback` 非空时调用方要把它回传给 AI，
+    让它知道"这一次看到的是全屏，不止前台包"。
+    """
+    texts: list = []
+    nodes = summarize_xml(xml_text, mode=mode, fg_package=fg_package,
+                          texts_out=texts)
+    effective = fg_package
+    fallback = None
+    if fg_package and not nodes and not texts:
+        _texts2: list = []
+        _nodes2 = summarize_xml(xml_text, mode=mode, fg_package=None,
+                                texts_out=_texts2)
+        if _nodes2 or _texts2:
+            # 只有"不过滤确实有东西"才算回退；两边都空说明屏幕真的空白
+            # （纯 Canvas 自绘页 / 加载中），此时不该谎报回退。
+            nodes, texts, effective = _nodes2, _texts2, None
+            fallback = {
+                "filtered_out": fg_package,
+                "reason": "按前台包过滤后整屏为空，已自动改为不过滤重算",
+                "why": ("屏幕主体不属于前台包：权限弹窗(permissioncontroller)、"
+                        "launcher 引导浮层(launchersdk)、通知栏(systemui)都会这样"),
+            }
+    return {
+        "nodes": nodes,
+        "texts": texts,
+        "next": next_targets(nodes, labeled=labeled_nodes(xml_text, effective)),
+        "sig": npm_identity(xml_text, effective),
+        "filter_fallback": fallback,
+    }
 
 
 def add_common_args(p: argparse.ArgumentParser) -> argparse.ArgumentParser:

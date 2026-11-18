@@ -31,7 +31,7 @@ from datetime import datetime
 from runtime import timed_call
 
 from common import (add_common_args, add_common_args_all_subcommands, apply_stdin_args, capture,
-                    next_targets, labeled_nodes, npm_identity,
+                    next_targets, labeled_nodes, npm_identity, screen_view, filtered_sig,
                     connect, emit, evidence_paths, fail, guard_terminated,
                     log_auto, rel, summarize_xml, texts_payload)
 import checkpoint
@@ -517,11 +517,20 @@ def main() -> None:
         info = {**info, "perm_intent_set": perm_inline}
     if perm_result and perm_result.get("detected"):
         info = {**info, "permission": perm_result}
-    # 落库前先算一份**屏幕身份签名**（`kind=value` 集合），随事件一起存。
-    # 用途：给这一步打一份「屏幕身份签名」，事后能认出当时停在哪一页。
+    # 落库前先读一屏：nodes + 文字 + 可点清单 + 身份签名（`kind=value` 集合）。
+    # 用途：①签名随事件一起存，事后能认出当时停在哪一页；
+    #      ②nodes/texts/next 后面直接复用，省掉对同一份 dump 的重复解析。
     # 只存签名不存整个 nodes —— 签名几十个短串，nodes 可能有上百个对象。
-    _sig = npm_identity(xml.read_text(encoding="utf-8"),
-                        None if getattr(args, "no_filter", False) else info.get("package"))
+    #
+    # ⚠️ 必须走 screen_view 而不是各自调 summarize_xml/labeled_nodes/npm_identity：
+    # 那三个函数都按同一个 fg_package 过滤，而过滤有"整屏滤空"的边界情况
+    # （弹窗属于别的包）。走统一入口才能让四份输出**同时**回退到不过滤，
+    # 否则会出现"nodes 有东西但 next 是空的"这种自相矛盾的返回（实测过）。
+    _view = screen_view(xml.read_text(encoding="utf-8"),
+                        mode="full" if getattr(args, "full", False) else "nav",
+                        fg_package=None if getattr(args, "no_filter", False)
+                        else info.get("package"))
+    _sig = _view["sig"]
     info = {**info, "sig": _sig}
     # 检查点：由工具判"这一步落在预期位置没有"。
     # 让 AI 不必再读 dump 自己认页面（那是会话时长的大头 —— 实测 58~64% 花在
@@ -537,21 +546,15 @@ def main() -> None:
     info["duration_scope"] = "core operation through capture/signature/crash check; excludes connection, event write and response"
     log_auto("act", f"act {args.action}", detail, info, rel(png), duration_ms, started_at)
 
-    _texts: list = []
-    nodes = summarize_xml(xml.read_text(encoding="utf-8"),
-                          mode="full" if getattr(args, "full", False) else "nav",
-                          fg_package=None if getattr(args, "no_filter", False)
-                          else info.get("package"),
-                          texts_out=_texts)
+    _texts = _view["texts"]
+    nodes = _view["nodes"]
     payload = {
         "action": action,
         **info,
         "evidence": {"png": str(png), "xml": str(xml), "meta": str(meta)},
         # 「下一步能点什么」精简清单放最前 —— 直接从上一层的返回走到下一步，
         # **不需要再单独 observe 拿坐标**（那会多花 2s 工具 + 10~15s 决策等待）。
-        "next": next_targets(nodes, labeled=labeled_nodes(
-            xml.read_text(encoding="utf-8"),
-            None if getattr(args, "no_filter", False) else info.get("package"))),
+        "next": _view["next"],
         "nodes": nodes,
         "nodes_count": len(nodes),
         "nodes_mode": "full" if getattr(args, "full", False) else "nav",
@@ -562,6 +565,14 @@ def main() -> None:
                  "texts_more>0 要看全就 full=true。"
                  "toast 等浮层不在 nodes 里，用 android_read OCR"),
     }
+    if _view["filter_fallback"]:
+        # 过滤回退必须显式告知：否则 AI 以为自己看的是「被测 App 的界面」，
+        # 实际是全屏（含 launcher/systemui 的节点），判「某功能不存在」会误判。
+        payload["filter_fallback"] = _view["filter_fallback"]
+        payload["filter_fallback_hint"] = (
+            "⚠️ 本屏按前台包过滤后为空，已自动改为不过滤（nodes 含其它包的节点）。"
+            "说明屏幕主体不属于前台 App：权限弹窗/桌面引导浮层/通知栏都会这样。"
+            "看 texts 和 nodes 判断实际内容，别因为 filter 不符就判「功能不存在」。")
     # `sig`（屏幕身份签名）和 `timing`（各阶段耗时）只落盘、不回传给 AI：
     # 它们由工具侧消费（checkpoint 判定、浮层检测、路径采集、离线性能分析），
     # AI 一个都不需要，白占返回体积。
