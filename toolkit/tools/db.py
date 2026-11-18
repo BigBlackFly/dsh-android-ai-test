@@ -47,10 +47,12 @@ from runtime import CALL_ID, STORAGE_DIR, current_record_dir, recording_issues
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# 「预期1 …」「预期3：…」「步骤2 …」这类前缀。与 common.py 里同名正则同口径
-# —— 不 import common 是为了避免循环依赖（common 在函数内 import db）。
+# 「预期1 …」「预期3：…」「步骤2 …」这类前缀，分组前要剥掉。与 common.py 里
+# 同名正则同口径 —— 不 import common 是为了避免循环依赖（common 在函数内 import db）。
+# 注意这里**只用于剥离**（把同一句文本的多种写法归一），不用于认编号；
+# 认编号只在 common.match_expect_id 里做，且那里**不认「步骤」**（步骤编号 ≠ 预期编号）。
 _EXPECT_PREFIX_RE = re.compile(
-    r"^\s*(?:预期|期望|断言|检查点|步骤|第)\s*\d{1,3}\s*(?:条)?\s*[:：.、,，]?\s*")
+    r"^\s*(?:(?:预期|期望|断言|检查点)\s*\d{1,3}|(?:步骤|第)\s*\d{1,3})\s*(?:条)?\s*[:：.、,，]?\s*")
 
 
 def _case_key(title: str | None, package: str | None = None) -> str:

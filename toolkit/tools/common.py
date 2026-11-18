@@ -665,9 +665,17 @@ def case_expectations(case_md_text: str | None) -> list[dict]:
         return []
 
 
-# 「预期1 …」「预期3：…」「步骤2 …」「第 3 条 …」这类前缀，比对前要剥掉
+# 「步骤2 …」「第 3 条 …」是**操作步骤**的编号，和预期编号是两套体系，只能剥不能认。
+# （实测：1391 条已填 expect_id 的 finding 里，156 条 = 11.2% 是「步骤N…」被误当成预期N，
+#   例如「步骤3（前置差异，非预期条目）」被填成 expect_id=3，混进真正的预期3 里。）
+_STEP_PREFIX_RE = re.compile(r"^\s*(?:步骤|第)\s*\d{1,3}\s*(?:条)?\s*[:：.、,，]?\s*")
+
+# 「预期1 …」「预期3：…」「断言4 …」这类前缀，比对前要剥掉，同时用来认编号
 _EXPECT_PREFIX_RE = re.compile(
-    r"^\s*(?:预期|期望|断言|检查点|步骤|第)\s*(?P<n>\d{1,3})\s*(?:条)?\s*[:：.、,，]?\s*")
+    r"^\s*(?:预期|期望|断言|检查点)\s*(?P<n>\d{1,3})\s*(?:条)?\s*[:：.、,，]?\s*")
+
+# 行首没有、但句子中间写了预期编号（「步骤2：预期3 提醒到期时有提醒」）时兜底
+_EXPECT_ANY_RE = re.compile(r"(?:预期|期望|断言|检查点)\s*(?P<n>\d{1,3})(?!\d)")
 
 
 def _norm_expect(s: str) -> str:
@@ -692,9 +700,16 @@ def match_expect_id(expectations: list[dict], expect_text: str) -> dict | None:
     三级匹配（都做过实测，缺一不可）：
       ① **编号前缀** —— AI 写「预期3 弹框关闭」「预期3：…」，直接取 3 去对 label。
          最常见；但**不能只靠它**（AI 会写错号、用例本身编号还可能是 3-4 区间）。
+         ⚠️ **只认「预期/期望/断言/检查点」，不认「步骤/第」** —— 步骤编号和预期编号
+         是两套体系，混用会把「步骤3（前置差异，非预期条目）」填成 expect_id=3
+         （实测 156/1391 = 11.2% 是这种误填，混进 flaky 统计会同时污染分子分母）。
       ② **归一化全等** —— 文本照抄用例原文，剥掉空白/标点差异后一致。
       ③ **包含匹配** —— AI 把原文缩写或加了前后缀；取最长命中且要求 ≥6 字，
          防止「正常」「成功」这类短词误配。
+
+    实际顺序：行首预期编号 → 句内预期编号兜底 → 全等 → 包含。句内兜底是为了救
+    「步骤2：预期3 提醒到期时有提醒」这种把两套编号写在一行的写法。
+    纯「步骤N …」的文本不会进 ①，但还能靠 ②③ 的内容匹配救回（实测 111 条里救回 29 条）。
 
     为什么值得做：不加这一步，`expect_id` 就只是个可选参数，实际没人传（AI
     不记得），字段永远是 NULL，跨轮比对还是做不了。让它**自动从文本反推**，
@@ -710,8 +725,8 @@ def match_expect_id(expectations: list[dict], expect_text: str) -> dict | None:
     def _hit(e: dict, how: str) -> dict:
         return {"id": e["id"], "label": e["label"], "match": how, "text": e["text"]}
 
-    # ① 编号前缀
-    m = _EXPECT_PREFIX_RE.match(raw)
+    # ① 编号前缀：行首优先，其次句内兜底
+    m = _EXPECT_PREFIX_RE.match(raw) or _EXPECT_ANY_RE.search(raw)
     if m:
         n = m.group("n")
         for e in exps:
@@ -724,7 +739,8 @@ def match_expect_id(expectations: list[dict], expect_text: str) -> dict | None:
                 if int(rg[0]) <= int(n) <= int(rg[1]):
                     return _hit(e, "label")
 
-    body = _EXPECT_PREFIX_RE.sub("", raw)
+    body = _STEP_PREFIX_RE.sub("", raw)
+    body = _EXPECT_PREFIX_RE.sub("", body)
     nb = _norm_expect(body)
     # ② 归一化全等
     for e in exps:
