@@ -67,7 +67,7 @@ try:
 except Exception:  # noqa: BLE001  common 不可用时不要因此崩掉
     pass
 
-
+# TODO: 把ATS的一些系统操作能力加入这里
 ACTIONS = ("notifications", "quick_settings", "close_shade", "wake", "unlock", "rotate")
 
 # 通知栏列表容器 / 单条通知行 / 快捷设置面板容器的 resource-id 片段
