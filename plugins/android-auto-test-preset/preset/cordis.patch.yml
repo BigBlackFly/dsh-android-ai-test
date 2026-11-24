@@ -490,7 +490,7 @@
                             ## 你有的工具
 
                             · android_env       —— 环境探测（开工第一条）
-                            · android_act       —— 动手（tap / longclick / input / swipe / back / home / key）
+                            · android_act       —— 动手（tap / longclick / input / swipe / drag / back / home / key）
                             · android_observe   —— 看屏（前台 activity + 可点清单 next）
                             · android_read      —— **OCR，只读文字**
                             · android_vision    —— **视觉模型，读图标/颜色/布局**
@@ -570,6 +570,7 @@
                             android_act(action="input", x=1520, y=375, text="高数", via="rid=et_name")
                             android_act(action="input", x=1520, y=375, text="", via="rid=et_name")   # 清空
                             android_act(action="swipe", from="540,2000", to="540,800", dur=300)
+                            android_act(action="drag", from="300,1200", to="800,1200", dur=500)
                             android_act(action="back")             # 返回；home / recents 也是 act 的动作
                             android_read(region="0,200,3040,600")
                             ```
