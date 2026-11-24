@@ -26,51 +26,6 @@ except AttributeError:
     pass
 
 
-def _layout_signal(img: Path) -> tuple[str, int]:
-    """与截图配对的 dump.xml 跑视图树堆叠检测，返回 (注入文本, 命中对数)。
-
-    背景（2026-11-23 实测）：AI 调 android_vision 时只贴自己的问题，
-    capture() 检出的 layout_overlap 信号根本不在场 —— 视觉模型不知道
-    该重点看哪。本函数把信号**自动**注入 prompt，调用方无感。
-    未命中/无 dump/解析失败一律返回 ("", 0)（无痕，不改变调用行为）。
-    """
-    try:
-        d = img.parent / "dump.xml"
-        if not d.exists():
-            return "", 0
-        fg = size = None
-        mp = img.parent / "meta.json"
-        if mp.exists():
-            m = json.loads(mp.read_text(encoding="utf-8"))
-            fg, size = m.get("package"), m.get("size")
-        from layout_check import scan
-        r = scan(d.read_text(encoding="utf-8"),
-                 fg_package=fg, screen_size=size)
-        if not r.get("parse_ok") or not r.get("overlaps"):
-            return "", 0
-        def _nm(x: dict) -> str:
-            return x.get("rid") or x.get("desc") or x.get("text") or x["class"]
-        lines = ["【视图树检测信号 —— 确定性坐标事实，请重点核对】",
-                 f"本屏视图树检出 {r['count']} 对控件堆叠，最严重几对："]
-        for o in r["overlaps"][:3]:
-            strict = bool((o["a"].get("clickable") or o["a"].get("text"))
-                          and (o["b"].get("clickable") or o["b"].get("text")))
-            tag = ("【语义内容重叠（可点/文本）——按业务规则直接定性 BUG，不豁免】"
-                   if strict else "")
-            lines.append(
-                f"- {o['kind']} iou={o['iou']}: "
-                f"{_nm(o['a'])}{o['a']['bounds']} × {_nm(o['b'])}{o['b']['bounds']}"
-                + (f" {tag}" if strict else ""))
-        lines.append("请在图上逐一核对："
-                     "可点控件与文本内容之间的重叠——哪怕只有一点——"
-                     "按业务规则直接定性为 BUG，不存在「设计性紧凑布局」的排除理由；"
-                     "仅非可点且无文本的装饰性叠加（角标压图标/悬浮球压内容/遮罩）"
-                     "可排除，但要说明。")
-        return "\n".join(lines), r["count"]
-    except Exception:  # noqa: BLE001
-        return "", 0
-
-
 def main() -> None:
     p = argparse.ArgumentParser(description="vision：视觉模型问图（OpenAI 兼容）")
     p.add_argument("--image", required=True, help="图片路径（png/jpg）")
@@ -99,16 +54,12 @@ def main() -> None:
     mime = "image/jpeg" if img.suffix.lower() in (".jpg", ".jpeg") else "image/png"
     b64 = base64.b64encode(img.read_bytes()).decode()
 
-    # 视图树信号自动融合：同目录 dump.xml 检出堆叠 → 注入 prompt 让视觉模型重点核对
-    sig, sig_count = _layout_signal(img)
-    prompt_text = args.prompt + ("\n\n" + sig if sig else "")
-
     body = json.dumps({
         "model": model,
         "messages": [{
             "role": "user",
             "content": [
-                {"type": "text", "text": prompt_text},
+                {"type": "text", "text": args.prompt},
                 {"type": "image_url",
                  "image_url": {"url": f"data:{mime};base64,{b64}"}},
             ],
@@ -158,9 +109,8 @@ def main() -> None:
     #    —— 分不清"记了但没 id"还是"根本没记"，绑证据时就会拿个空值上去。
     _eid = log_auto(
         "vision", "vision ask",
-        f"问图：{args.prompt[:40]}" + (f"（含视图树信号 {sig_count} 对）" if sig_count else ""),
+        f"问图：{args.prompt[:40]}",
         {"image": str(img), "prompt": args.prompt,
-         "layout_signal": sig_count,
          "answer": text, "usage": usage,
          "model": model, "max_tokens": args.max_tokens},
         rel(img), None,
@@ -168,11 +118,6 @@ def main() -> None:
 
     payload = {"text": text, "usage": usage,
                "hint": "视觉模型输出是辅助判据，PASS/FAIL 结论仍需结合 dump/OCR 证据"}
-    if sig_count:
-        payload["layout_signal_injected"] = sig_count
-        payload["layout_signal_note"] = (
-            f"已自动把视图树检出的 {sig_count} 对堆叠注入本次问图 prompt"
-            "（最严重 3 对），视觉模型被要求重点核对。")
     if _eid:
         payload["event_id"] = _eid
         payload["evidence"] = rel(img)

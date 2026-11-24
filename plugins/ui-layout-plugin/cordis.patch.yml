@@ -1,7 +1,0 @@
-- insert:
-    - id: ui-layout-check
-      name: '@local/dsh-ui-layout-check'
-      config:
-        # 工具层根目录（含 .venv / tools / storage），与 android-tools 插件同源。
-        # layout_check.py 位于 <target>\toolkit 侧的 tools 目录（Android 测试安装产物）。
-        target: 'D:\dsh\android-ai-test'

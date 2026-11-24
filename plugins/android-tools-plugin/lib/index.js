@@ -570,6 +570,62 @@ export function apply(ctx, config = {}) {
 
   ctx.tools.register(
     defineTool({
+      name: 'android_layout_check',
+      description:
+        '视图树堆叠检测（确定性坐标事实，非 AI 判定）：对证据目录里的 dump.xml 做叶子节点两两配对，返回谁压谁、压多少（IoU/包含比、bounds），按严重度排序，双可点互压最前。结论或 finding 涉及「重叠/遮挡/截断/错位/挤压/布局/自适应」时，下结论前先调它拿坐标事实，再结合截图做语义判定。可点控件与带文本的语义内容 1px 相交即报（strict）；纯装饰叶子维持 IoU 阈值。分析目标自动对准当前会话登记的被测 App，不用传包名。返回 tree_blind=true 表示目标包节点不在视图树（浮窗/分屏机型盲区），本结果不可信，改走 android_vision 看截图。',
+      parameters: {
+        evidence: {
+          type: 'string',
+          description:
+            '证据目录路径（内含 dump.xml + meta.json），如 storage/run_history/<会话>/evidence/<case>/<step>。与 xml 二选一，推荐用目录',
+        },
+        xml: {
+          type: 'string',
+          description: 'dump.xml 路径（与 evidence 二选一）',
+        },
+        package: {
+          type: 'string',
+          description:
+            '可选。覆盖过滤包名（默认自动：会话登记的被测包 > 证据 meta.json 的 focus 包）。查其它窗口时才传',
+        },
+        iou: { type: 'number', description: '非语义叶子的 IoU 阈值，默认 0.3（strict 对不受此限：1px 相交即报）' },
+        contain: { type: 'number', description: '被吞面积比阈值，默认 0.8' },
+        max: { type: 'number', description: '最多返回条数，默认 10（按严重度截断）' },
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: true,
+          properties: {
+            ok: { type: 'boolean' },
+            scanned: { type: 'number' },
+            count: { type: 'number' },
+            strict_count: { type: 'number' },
+            overlaps: { type: 'array' },
+            package: { type: 'string' },
+            pkg_found: { type: 'boolean' },
+            tree_blind: { type: 'boolean' },
+          },
+        },
+        render: (_a, v) => [
+          { type: 'text', text: typeof v === 'string' ? v : JSON.stringify(v) },
+        ],
+      },
+      async execute(args, exec) {
+        const rest = []
+        if (args.evidence) rest.push('--evidence', String(args.evidence))
+        if (args.xml) rest.push('--xml', String(args.xml))
+        if (args.package) rest.push('--package', String(args.package))
+        if (args.iou != null) rest.push('--iou', String(args.iou))
+        if (args.contain != null) rest.push('--contain', String(args.contain))
+        if (args.max != null) rest.push('--max', String(args.max))
+        return runTool('layout_check.py', rest, exec)
+      },
+    }),
+  )
+
+  ctx.tools.register(
+    defineTool({
       name: 'android_perm',
       description:
         '查 / 授 / 撤 App 的运行时权限（走 adb，不经过界面弹窗）。**只在必要时用**：用例明确要测某个需要权限的功能、而权限还没授予时，先查一次再决定；或需要复现「权限没给」的场景时撤销。日常点击触发的权限弹窗由 android_act 自动处理，不用管。',

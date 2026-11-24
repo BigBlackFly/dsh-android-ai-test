@@ -181,20 +181,12 @@ def scan(xml_text: str, fg_package: str | None = None,
     return out
 
 
-def _brief(h: dict) -> str:
-    """一行人话摘要（给 payload 摘要用）。"""
-    def who(n: dict) -> str:
-        tag = n["rid"] or n["text"] or n["desc"] or n["class"]
-        return f"{n['class']}[{tag}]" + ("(可点)" if n["clickable"] else "")
-    return f"{who(h['a'])} × {who(h['b'])} ({h['kind']} iou={h['iou']})"
-
-
 def main() -> None:
     from common import apply_stdin_args, emit, fail  # 延迟导入：scan 保持零依赖可测
     p = argparse.ArgumentParser(description="layout_check：视图树堆叠检测（确定性事实）")
     p.add_argument("--xml", help="dump.xml 路径")
     p.add_argument("--evidence", help="证据目录路径（内含 dump.xml，与 --xml 二选一）")
-    p.add_argument("--package", help="按前台包名过滤（默认自动读同目录 meta.json 的 package）")
+    p.add_argument("--package", help="按前台包名过滤（默认自动读当前会话登记的被测包，再退 meta.json）")
     p.add_argument("--iou", type=float, default=DEFAULT_IOU)
     p.add_argument("--contain", type=float, default=DEFAULT_CONTAIN)
     p.add_argument("--max", type=int, default=_MAX_OUT)
@@ -243,6 +235,7 @@ def main() -> None:
                max_out=args.max)
     if not res.get("parse_ok"):
         fail(f"扫描失败: {res.get('error')}")
+    # 只产坐标事实，不做异常判定——语义裁决归 AI（结合截图/视觉）。
     payload = {
         "ok": True,
         "scanned": res["scanned"],
@@ -254,64 +247,17 @@ def main() -> None:
     }
     if res.get("more"):
         payload["more"] = res["more"]
-    # 判定建议（业务规则下的规则性建议，非 AI 语义裁决）：
-    #   语义内容（可点/文本）重叠 → verdict_hint=FAIL；
-    #   tree_blind 时结果不可信，不给 verdict（避免误导）。
+    # tree_blind 是覆盖度事实（不是判定）：目标包节点不在 dump 里，
+    # 浮窗/分屏机型 ROM 抓不到非焦点窗口时本结果对目标 App 不可信。
     tree_blind = bool(fg) and not res.get("pkg_found")
-    strict_count = res.get("strict_count", 0)
-    if tree_blind:
-        verdict_hint = None
-        verdict_reason = None
-    elif strict_count > 0:
-        verdict_hint = "FAIL"
-        verdict_reason = (f"检出 {strict_count} 对可点/文本控件重叠"
-                          "（业务规则：语义内容 1px 相交即 BUG）")
-    else:
-        verdict_hint = "PASS"
-        verdict_reason = ("视图树层面无语义内容重叠"
-                          "（自绘内容不在树内，必要时仍需视觉核对）")
-    payload["verdict_hint"] = verdict_hint
-    payload["verdict_reason"] = verdict_reason
-    payload["hint"] = (
-        "这是**确定性坐标事实**，不是异常判定：两源一致（你视觉也见堆叠）才可判"
-        "布局异常。业务规则：**可点控件与文本内容之间不能有任何重叠**（双可点或"
-        "带文本的语义内容 1px 相交即报，不接受「设计性紧凑布局」辩护）；"
-        "仅非可点且无文本的装饰性叠加（角标压图标/悬浮球压内容/遮罩）可排除，"
-        "但 PASS 时 finding 必须写明排除理由。verdict_hint=FAIL 时判 PASS "
-        "会被 findings-batch 布局闸门拒绝，必须在 actual 写明排除理由。"
-        "本轮排序：双可点互压排最前。")
     if tree_blind:
         payload["tree_blind"] = True
         payload["hint"] = (
-            f"⚠️ 树盲区：目标包 {fg} 的节点不在本 dump 里（多窗口/浮窗场景部分机型"
-            "抓不到非焦点窗口）。本结果对目标 App **不可信**——涉及浮窗/分屏内部"
-            "布局的判定必须改走视觉核对（android_vision 看截图，重点查按钮重叠/"
-            "遮挡/截断），不要以本扫描为准。")
+            f"树盲区：目标包 {fg} 的节点不在本 dump 里（多窗口/浮窗场景部分机型"
+            "抓不到非焦点窗口），本结果对目标 App 不可信，改走 android_vision 视觉核对。")
     elif res["count"] == 0:
-        payload["hint"] = ("未检出控件堆叠（目标包可见叶子两两无交集超阈值）。"
-                           "注意：自绘内容（SurfaceView/Canvas）不在视图树里，"
-                           "那类问题仍走视觉判定，且单源结论需注明。")
-    # 结果快照落盘：证据与结论物理绑定，findings-batch 布局闸门据此校验
-    try:
-        from datetime import datetime
-        snapshot = {
-            "ts": datetime.now().isoformat(timespec="seconds"),
-            "package": fg,
-            "pkg_found": res.get("pkg_found"),
-            "tree_blind": tree_blind,
-            "scanned": res["scanned"],
-            "count": res["count"],
-            "strict_count": strict_count,
-            "verdict_hint": verdict_hint,
-            "verdict_reason": verdict_reason,
-            "overlaps": res["overlaps"],
-        }
-        save_fp = xml_fp.parent / "layout_check.json"
-        save_fp.write_text(json.dumps(snapshot, ensure_ascii=False, indent=1),
-                           encoding="utf-8")
-        payload["saved_to"] = str(save_fp)
-    except OSError:
-        pass  # 落盘失败不影响返回（闸门届时按「无检测记录」处理）
+        payload["hint"] = ("视图树层面未检出控件堆叠。自绘内容（SurfaceView/Canvas）"
+                           "不在视图树里，那类问题仍需视觉判定。")
     emit(True, payload)
 
 

@@ -26,7 +26,7 @@ from db import (  # noqa: I001
     set_current,
 )
 from runtime import (
-    CASES_DIR, ROOT, STORAGE_DIR, current_record_dir,
+    CASES_DIR, STORAGE_DIR, current_record_dir,
     detect_shell, last_record_dir, new_record_dir, pin_record,
     require_writable_storage, unpin_record,
 )
@@ -49,100 +49,8 @@ def maybe_file(v: str) -> str:
     （旧 skill 的 GBK 事故同族）；用例口述这种长文本一律建议走 @文件。
     """
     if v and v.startswith("@"):
-s      return Path(v[1:]).read_text(encoding="utf-8")
+        return Path(v[1:]).read_text(encoding="utf-8")
     return v
-
-
-# ══ 布局一致性闸门（2026-11-24，方案 1+2 组合）═════════════════════════
-#
-# 背景：ui_layout_check 检出可点/文本控件重叠后，AI 仍可能在 findings 里
-# 错误判 PASS（实测 ff73c18f 会话：检出 btn_group_menu×iv_edit 却判无重叠）。
-# 机制保证：提交时自动核对「检出结果」与「判定结论」的一致性。
-#
-# 校验依据是 **落盘的检出事实**（evidence 目录的 layout_check.json），
-# 不解析 expect 语义——关键词只能绕开，坐标事实绕不开：
-#   规则 1：检出语义内容重叠（strict）+ 判 PASS + 无排除理由 → 拒绝
-#   规则 2：expect 含布局关键词 + 有证据目录 + 从未跑过 ui_layout_check → 拒绝
-#   规则 3：expect 含布局关键词 + 连 event_id 都没挂 → 拒绝
-#   规则 4：tree_blind + 判 PASS + 未提及视觉核对 → 拒绝
-# 逃生门 --skip-layout-gate：仅限工具异常/证据丢失，正常流程禁用。
-_LAYOUT_KW_RE = re.compile("重叠|遮挡|截断|错位|挤压|布局|自适应|完整")
-
-
-def _layout_gate(items: list[dict]) -> str | None:
-    """findings 提交前的布局一致性校验。返回拒绝文案（None=放行）。"""
-    conn = get_db()._conn()
-    for i, it in enumerate(items, 1):
-        st = it.get("status")
-        if st not in ("PASS", "FAIL"):
-            continue
-        expect = it.get("expect") or ""
-        actual = it.get("actual") or ""
-        note = it.get("note") or ""
-        text_all = f"{actual} {note}"
-        ev_ids = it.get("event_id") or it.get("event_ids") or []
-        if isinstance(ev_ids, int):
-            ev_ids = [ev_ids]
-        # 收集证据目录（evidence 存的是 shot.png 相对路径 → 上一级即 step 目录）
-        dirs: list[Path] = []
-        for eid in ev_ids:
-            row = conn.execute(
-                "SELECT evidence FROM events WHERE id=?", (eid,)).fetchone()
-            if row and row["evidence"]:
-                p = Path(row["evidence"])
-                if not p.is_absolute():
-                    p = ROOT / p
-                dirs.append(p.parent)
-        strict_hits: list[dict] = []
-        tree_blind = False
-        has_check = False
-        for d in dirs:
-            lc = d / "layout_check.json"
-            if not lc.is_file():
-                continue
-            has_check = True
-            try:
-                data = json.loads(lc.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                continue
-            if data.get("tree_blind"):
-                tree_blind = True
-            if data.get("strict_count", 0) > 0:
-                strict_hits.append(data)
-        # 规则 1：检出语义内容重叠 + 判 PASS + 无排除理由 → 拒
-        if strict_hits and st == "PASS" and "排除" not in text_all:
-            worst = strict_hits[0]
-            ov = (worst.get("overlaps") or [{}])[0]
-            a, b = ov.get("a", {}), ov.get("b", {})
-            nm = (lambda x: x.get("rid") or x.get("desc")
-                  or x.get("text") or x.get("class", "?"))
-            return (
-                f"第 {i} 项被布局一致性闸门拒绝：该步骤 ui_layout_check 检出 "
-                f"{worst.get('strict_count')} 对可点/文本控件重叠"
-                f"（如 {nm(a)} × {nm(b)}, iou={ov.get('iou')}）但判 PASS。二选一："
-                "① 改 status=FAIL；② 在 actual 写明排除理由"
-                "（针对哪一对、为何可排除——可点/文本重叠不接受设计性辩护），"
-                "重新提交")
-        # 规则 2：布局类断言 + 有证据目录 + 从未跑过检测 → 拒
-        if _LAYOUT_KW_RE.search(expect) and dirs and not has_check:
-            return (
-                f"第 {i} 项被布局一致性闸门拒绝：expect 含布局类关键词，"
-                "但该步骤没有 ui_layout_check 结果——先对 evidence 目录调用 "
-                "ui_layout_check 再提交（--skip-layout-gate 仅限工具异常/"
-                "证据丢失，正常流程禁用）")
-        # 规则 3：布局类断言 + 连 event_id 都没挂 → 拒
-        if _LAYOUT_KW_RE.search(expect) and not ev_ids:
-            return (
-                f"第 {i} 项被布局一致性闸门拒绝：布局类断言必须挂 event_id"
-                "（证据链），否则无法核对检出结果与结论的一致性")
-        # 规则 4：tree_blind + PASS + 未提及视觉核对 → 拒
-        if (tree_blind and st == "PASS"
-                and not re.search(r"视觉|vision|OCR|截图", text_all, re.I)):
-            return (
-                f"第 {i} 项被布局一致性闸门拒绝：该步骤树检 tree_blind=true"
-                "（目标包不在视图树，树检不可信），判 PASS 必须在 actual 写明"
-                "视觉核对依据（android_vision / OCR）后重新提交")
-    return None
 
 
 # 「弹窗标题」类 rid：出现即说明某个弹层打开了，是最可靠的页内落点。
@@ -616,8 +524,6 @@ def main() -> None:
     s.add_argument("--note", default="")
     s.add_argument("--event-id", action="append", type=int, default=[],
                    help="关联本会话证据事件；可重复传入多个事件 ID")
-    s.add_argument("--skip-layout-gate", action="store_true",
-                   help="跳过布局一致性闸门（仅限工具异常/证据丢失，正常流程禁用）")
     s.add_argument("--expect-id", type=int, default=None, dest="expect_id",
                    help="这条断言对应用例原文的第几条预期（1 起）。**通常不用传**："
                         "不给就会拿 expect 文本自动去对用例原文；"
@@ -642,8 +548,6 @@ def main() -> None:
     s.add_argument("--file", required=True,
                    help="JSON 文件：数组，每项 {status, expect, actual, "
                         "event_id:[..], note}")
-    s.add_argument("--skip-layout-gate", action="store_true",
-                   help="跳过布局一致性闸门（仅限工具异常/证据丢失，正常流程禁用）")
     s.add_argument("--id", type=int, default=None, help="指定会话（默认当前）")
 
     s = sub.add_parser("finish")
@@ -928,15 +832,8 @@ def main() -> None:
         _exp_text = maybe_file(args.expect)
         _eid, _elab = _resolve_expect_id(db, sid, _exp_text,
                                           getattr(args, "expect_id", None))
-        item = {"status": args.status, "expect": _exp_text,
-                "actual": maybe_file(args.actual), "note": maybe_file(args.note),
-                "event_id": args.event_id}
-        if not getattr(args, "skip_layout_gate", False):
-            reject = _layout_gate([item])
-            if reject:
-                raise SystemExit(reject)
         fid = db.add_finding(sid, args.status, _exp_text,
-                             item["actual"], item["note"],
+                             maybe_file(args.actual), maybe_file(args.note),
                              event_ids=args.event_id,
                              expect_id=_eid, expect_label=_elab)
         emit(True, {"finding_id": fid, "evidence_event_ids": args.event_id,
@@ -966,11 +863,6 @@ def main() -> None:
                     f"第 {i} 项 status 不合法：{st!r}（可用 {'/'.join(STATUSES)}）")
             if not it.get("expect"):
                 raise SystemExit(f"第 {i} 项缺 expect")
-        # 布局一致性闸门：检出结果 vs 判定结论（--skip-layout-gate 逃生门）
-        if not getattr(args, "skip_layout_gate", False):
-            reject = _layout_gate(items)
-            if reject:
-                raise SystemExit(reject)
         ids = []
         _matched = []
         for it in items:
