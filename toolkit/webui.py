@@ -263,6 +263,7 @@ def all_sessions(include: tuple[str, ...] | None = None,
         r = dict(r)
         r["local_id"] = r.get("id")
         r["run_id"] = r.get("run_id") or ""
+        r["has_video"] = _run_has_video(r["run_id"])
         out.append(r)
     out.sort(key=lambda r: str(r.get("started_at") or ""), reverse=True)
     # 结论筛选（前端「按结论筛选」多选按钮 → URL ?status=PASS&status=FAIL）
@@ -289,7 +290,34 @@ def session_detail(sid: str, include_events: bool = True) -> dict | None:
     s = dict(s)
     s["local_id"] = s.get("id")
     s["run_id"] = s.get("run_id") or _rid or ""
+    s["has_video"] = _run_has_video(s.get("run_id"))
     return s
+
+
+def _run_has_video(run_id: str | None) -> bool:
+    if not run_id or not re.fullmatch(r"[\w-]{1,80}", str(run_id)):
+        return False
+    video_dir = STORAGE_DIR / "run_history" / str(run_id) / "video"
+    try:
+        from video_recording import reconcile_recording, _read_manifest, _validated_segments
+        reconcile_recording(video_dir)
+        manifest = _read_manifest(video_dir)
+        return bool(_validated_segments(video_dir, manifest))
+    except Exception:
+        # Broken/old metadata must not break the session list.
+        pass
+    try:
+        manifest = json.loads((video_dir / "index.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    for segment in manifest.get("segments") or []:
+        name = str(segment.get("file") or "")
+        if not re.fullmatch(r"part-\d+\.mp4", name):
+            continue
+        candidate = (video_dir / name).resolve()
+        if candidate.parent == video_dir.resolve() and candidate.is_file() and candidate.stat().st_size > 1024:
+            return True
+    return False
 
 
 def session_stats_all() -> dict:
@@ -856,10 +884,41 @@ class Handler(BaseHTTPRequestHandler):
         p = Path(relpath)
         if p.parts and p.parts[0] == STORAGE_DIR.name:
             candidates.append(ROOT / p)
+        if p.parts and p.parts[0] == "run_history":
+            candidates.append(STORAGE_DIR / p)
         for fp in candidates:
             fp = fp.resolve()
             # is_relative_to 而非 startswith：字符串前缀会放过同前缀兄弟目录
             if fp.is_relative_to(STORAGE_DIR) and fp.is_file():
+                if fp.suffix.lower() == ".mp4":
+                    data = fp.read_bytes()
+                    range_header = self.headers.get("Range", "")
+                    match = re.match(r"bytes=(\d*)-(\d*)$", range_header)
+                    if match:
+                        start = int(match.group(1) or 0)
+                        end = int(match.group(2) or len(data) - 1)
+                        if start >= len(data) or end < start:
+                            self.send_response(416)
+                            self.send_header("Content-Range", f"bytes */{len(data)}")
+                            self.end_headers()
+                            return
+                        end = min(end, len(data) - 1)
+                        chunk = data[start:end + 1]
+                        self.send_response(206)
+                        self.send_header("Content-Type", "video/mp4")
+                        self.send_header("Content-Range", f"bytes {start}-{end}/{len(data)}")
+                        self.send_header("Accept-Ranges", "bytes")
+                        self.send_header("Content-Length", str(len(chunk)))
+                        self.end_headers()
+                        self.wfile.write(chunk)
+                        return
+                    self.send_response(200)
+                    self.send_header("Content-Type", "video/mp4")
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
                 return self._send(200, fp.read_bytes(),
                                   MIME.get(fp.suffix, "application/octet-stream"))
         return self._json({"error": "not found"}, 404)
@@ -924,6 +983,42 @@ class Handler(BaseHTTPRequestHandler):
         m = re.match(r"^/api/sessions/([^/]+)/replay$", path)
         if m:
             return self._replay(urllib.parse.unquote(m.group(1)))
+
+        m = re.match(r"^/api/sessions/([^/]+)/video$", path)
+        if m:
+            sid = urllib.parse.unquote(m.group(1))
+            s = session_detail(sid, include_events=False)
+            if not s:
+                return self._json({"error": "not found"}, 404)
+            run_id = s.get("run_id") or ""
+            if not re.fullmatch(r"[\w-]{1,80}", str(run_id)):
+                return self._json({"error": "该记录没有有效的录屏目录"}, 404)
+            video_dir = STORAGE_DIR / "run_history" / str(run_id) / "video"
+            try:
+                from video_recording import reconcile_recording, _validated_segments
+                reconcile_recording(video_dir)
+            except Exception:
+                pass
+            try:
+                manifest = json.loads((video_dir / "index.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                return self._json({"error": "该记录没有录屏"}, 404)
+            segments = []
+            for segment in manifest.get("segments") or []:
+                name = str(segment.get("file") or "")
+                if not re.fullmatch(r"part-\d+\.mp4", name):
+                    continue
+                fp = (video_dir / name).resolve()
+                if fp.parent != video_dir.resolve():
+                    continue
+                try:
+                    from video_recording import video_file_info
+                    valid = video_file_info(fp).get("valid")
+                except Exception:
+                    valid = False
+                if valid:
+                    segments.append({**segment, "url": f"/files/run_history/{run_id}/video/{name}"})
+            return self._json({"title": s.get("title") or "", "segments": segments})
 
         m = re.match(r"^/api/sessions/([^/]+)$", path)
         if m:

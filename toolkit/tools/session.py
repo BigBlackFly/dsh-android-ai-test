@@ -30,6 +30,7 @@ from runtime import (
     detect_shell, last_record_dir, new_record_dir, pin_record,
     require_writable_storage, unpin_record,
 )
+from video_recording import start_video_recording, stop_video_recording
 
 # 只有这几条不写盘。其余一律进门先实测 storage 可写性 ——
 # 否则报错点会漂到后面某个不相干的调用上，根本看不出是 storage 的问题。
@@ -628,14 +629,6 @@ def main() -> None:
     #
     #   现在：不合法就直接退，一个字节都不写。
     # ══════════════════════════════════════════════════════════════
-    # start 时先建运行目录，再开库（get_db 读 ANDROID_TEST_RECORD 定库位置）
-    if args.cmd == "start" and not current_record_dir():
-        _rec = new_record_dir()
-        # pin_record 同时做两件事：设环境变量（本进程内）+ 写磁盘指针
-        # （供后续 observe/act 这些独立进程读）
-        pin_record(_rec)
-        print(json.dumps({"record_dir": str(_rec)}, ensure_ascii=False))
-
     db = get_db()
 
     if args.cmd == "start":
@@ -714,6 +707,13 @@ def main() -> None:
             raise SystemExit("需要 --case <编号>"
                              "（编号在本应用内重复时写 模块_编号）"
                              "或 --title/--input（新用例，中文长文本用 @文件）")
+
+        # 只有通过重复会话检查和参数校验后才创建并 pin 新运行目录。
+        # 否则一次被拒绝的 start 会把仍在运行会话的记录指针切走。
+        _rec = new_record_dir()
+        pin_record(_rec)
+        print(json.dumps({"record_dir": str(_rec)}, ensure_ascii=False))
+
         sid = db.start_session(title, user_input, args.device,
                                kind="diag" if args.diag else "test")
         set_current(sid)
@@ -796,6 +796,21 @@ def main() -> None:
             restart_note = "已跳过冷启动复位（--no-restart），**起点不固定**，需自行确认当前界面"
         if restart_note:
             device_note = f"{device_note}；{restart_note}"
+
+        # 录屏在 App 冷启动后开始，落入本次唯一 run_history 目录。
+        # 录屏是辅助证据；环境不支持时只提示，不阻断测试用例。
+        video_note = "录屏未启动（设备未连接）"
+        if d is not None:
+            try:
+                _serial = args.device or getattr(d, "serial", None)
+                _size = d.window_size()
+                _video = start_video_recording(_serial, current_record_dir(), _size)
+                video_note = ("录屏已启动"
+                              if _video.get("started")
+                              else f"录屏未启动：{_video.get('reason') or '未知原因'}")
+            except Exception as _video_error:
+                video_note = f"录屏未启动：{_video_error}"
+        device_note = f"{device_note}；{video_note}"
 
         (STORAGE_DIR / f".crash_seen_{sid}").unlink(missing_ok=True)
         out = {"ok": True, "session_id": sid, "related": related,
@@ -913,6 +928,11 @@ def main() -> None:
         if not sid:
             raise SystemExit("没有进行中的会话（要收尾别的会话请加 --id）")
         summary = maybe_file(args.summary)
+        _session_row = db.get_session(sid) or {}
+        _run_id = _session_row.get("run_id")
+        _video_dir = STORAGE_DIR / "run_history" / str(_run_id) if _run_id else None
+        _video_result = stop_video_recording(_video_dir) if _video_dir else {
+            "stopped": False, "reason": "当前会话没有 run_id"}
         ok = db.finish_session(sid, args.status, summary, args.package)
         cleanup_warning = None
         try:
@@ -964,6 +984,7 @@ def main() -> None:
                         "结论应为 BLOCKED 且报告需附 crash.log 证据路径；"
                         "无关包崩溃仅需在报告中说明")
                if crash_n else "无崩溃事件"}
+        out["video_recording"] = _video_result
         if steps_note:
             out["steps_exported"] = steps_note
             out["steps_note"] = (
@@ -1005,11 +1026,16 @@ def main() -> None:
         # 崩溃终止过的会话只能落 BLOCKED（db.finish_session 里写死的规矩），
         # 这里跟着让步，别让人卡在一个想不通的 ValueError 上。
         final = "BLOCKED" if row.get("terminated") else "ERROR"
+        _run_id = row.get("run_id")
+        _video_dir = STORAGE_DIR / "run_history" / str(_run_id) if _run_id else None
+        _video_result = stop_video_recording(_video_dir) if _video_dir else {
+            "stopped": False, "reason": "当前会话没有 run_id"}
         db.finish_session(sid, final, f"作废：{reason}")
         if cur == sid:
             clear_current(sid)
         unpin_record()
         emit(True, {"session_id": sid, "status": final, "reason": reason,
+                    "video_recording": _video_result,
                     "note": ("已作废收尾，不计入用例通过率；"
                              + ("该会话曾被崩溃终止，按规矩落 BLOCKED；"
                                 if final == "BLOCKED" else "进 ERROR 桶；")
@@ -1042,6 +1068,10 @@ def main() -> None:
             try:
                 # 崩溃终止过的只能落 BLOCKED（finish_session 的规矩）
                 final = "BLOCKED" if s["terminated"] else "ERROR"
+                _run_id = (db.get_session(s["id"]) or {}).get("run_id")
+                _video_result = (stop_video_recording(STORAGE_DIR / "run_history" / _run_id)
+                                 if _run_id else {"stopped": False,
+                                                  "reason": "run_id 不存在"})
                 db.finish_session(s["id"], final, reason)
             except (ValueError, sqlite3.Error, OSError) as e:  # noqa: PERF203
                 failed.append({"id": s["id"], "error": str(e)})
@@ -1050,6 +1080,7 @@ def main() -> None:
                 clear_current(s["id"])
                 unpin_record()
             done.append({"id": s["id"], "status": final,
+                         "video_recording": _video_result,
                          "idle_min": s["idle_min"], "events": s["events"]})
         emit(not failed, {"reaped": done, "failed": failed,
                           "note": (f"回收 {len(done)} 个僵尸会话，进 ERROR 桶，"
