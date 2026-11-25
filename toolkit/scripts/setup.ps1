@@ -214,7 +214,9 @@ if ($SkipDeps) {
 
     Write-Info '安装 uiautomator2 / rapidocr / pillow 等（首次较慢，请耐心）...'
     $req = Join-Path $Root 'requirements.txt'
-    $r = Invoke-Native $VenvPy @('-m','pip','install','-r',$req)
+    # 走 ctyun 镜像：直连 pypi.org 的 200MB 在国内经常十几分钟甚至超时（见 requirements.txt 头部说明）
+    $r = Invoke-Native $VenvPy @('-m','pip','install','-r',$req,
+        '-i','https://mirrors.ctyun.cn/pypi/simple','--trusted-host','mirrors.ctyun.cn')
     $r.Output | Select-Object -Last 5 | ForEach-Object { Write-Info $_ }
     if (-not $r.Ok) {
         Write-Fail "依赖安装失败（退出码 $($r.ExitCode)），请检查网络或代理后重试"

@@ -507,6 +507,7 @@
                             · bash              —— 只用来跑 `session.py`（开会话、记断言、收尾）
                                                   动设备、看屏幕一律走 android_* 工具，不要用 bash
                             · read/glob/grep    —— 读 SKILL.md、读知识卡、看用例 md
+                            · android_layout_check —— **UI 布局坐标事实**（重叠/遮挡类判定前先调，见下）
                             · skill             —— 按 SKILL.md 的工作流执行
 
                             ## ★ 要看图时怎么选
@@ -532,6 +533,21 @@
                             ```
 
                             OCR 读不清就换 `android_vision` 问一句。
+
+                            ## ★ 布局类判定先取坐标事实：`android_layout_check`
+
+                            结论或 finding 涉及「重叠 / 遮挡 / 截断 / 错位 / 挤压 /
+                            布局 / 自适应」时，下结论前先调
+                            `android_layout_check`（传 evidence 目录即可，自动对准
+                            当前会话登记的被测 App，不用传包名）拿确定性坐标事实，
+                            再结合截图做语义判定：
+
+                            · 业务规则：**只有可点击控件互相堆叠才判 FAIL**
+                              （双可点 1px 相交即报，不接受「设计性紧凑布局」辩护）；
+                              文字/文本堆叠暂不作为 FAIL 标准，只作坐标事实参考；
+                              装饰性叠加（角标压图标/悬浮球/遮罩）可排除，排除要写理由
+                            · 返回 `tree_blind: true` 是浮窗/分屏树盲区，结果不可信，
+                              改走 `android_vision` 看截图核对
 
                             ## ⓪ 第一步：android_env，然后先查卡
 
