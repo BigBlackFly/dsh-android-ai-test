@@ -492,8 +492,8 @@ def main() -> int:
 
     print()
     ok(f"装完了。落点 {to}")
-    print(f"   开会话：cd {to / 'toolkit'} && "
-          f"{'./.venv/bin/python' if not IS_WIN else '.venv\\Scripts\\python.exe'} "
+    session_py = ".venv\\Scripts\\python.exe" if IS_WIN else "./.venv/bin/python"
+    print(f"   开会话：cd {to / 'toolkit'} && {session_py} "
           "tools/session.py start --package <包名> ...")
     print(f"   产物：{to / 'toolkit' / 'storage'}（在工作区内，沙箱写得住；用例历史与证据都在这）")
     print(f"   还没挂 DSH 的话：python3 install.py --to {to} --wire，然后重启 harness")

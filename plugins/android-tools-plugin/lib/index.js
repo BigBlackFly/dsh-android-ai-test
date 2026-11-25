@@ -572,7 +572,7 @@ export function apply(ctx, config = {}) {
     defineTool({
       name: 'android_layout_check',
       description:
-        '视图树堆叠检测（确定性坐标事实，非 AI 判定）：对证据目录里的 dump.xml 做叶子节点两两配对，返回谁压谁、压多少（IoU/包含比、bounds），按严重度排序，双可点互压最前。结论或 finding 涉及「重叠/遮挡/截断/错位/挤压/布局/自适应」时，下结论前先调它拿坐标事实，再结合截图做语义判定。可点控件与带文本的语义内容 1px 相交即报（strict）；纯装饰叶子维持 IoU 阈值。分析目标自动对准当前会话登记的被测 App，不用传包名。返回 tree_blind=true 表示目标包节点不在视图树（浮窗/分屏机型盲区），本结果不可信，改走 android_vision 看截图。',
+        '视图树堆叠检测（确定性坐标事实，非 AI 判定）：对证据目录里的 dump.xml 做叶子节点两两配对，返回谁压谁、压多少（IoU/包含比、bounds），按严重度排序，双可点互压最前。结论或 finding 涉及「重叠/遮挡/截断/错位/挤压/布局/自适应」时，下结论前先调它拿坐标事实，再结合截图做语义判定。**只有双可点控件堆叠才构成 FAIL 强信号**（strict，1px 相交即报）；文字/文本堆叠暂不作为 FAIL 标准，仅按 IoU 阈值呈现坐标事实供参考。分析目标自动对准当前会话登记的被测 App，不用传包名。返回 tree_blind=true 表示目标包节点不在视图树（浮窗/分屏机型盲区），本结果不可信，改走 android_vision 看截图。每次调用自动回填 layout_check.json（latest + runs 历史）供复核；**命中时返回 boxes_image=问题现场截图（命中处已画红框+编号）**，把它传给 android_vision 做重点核对并扫全屏。两者只做记录与可视化，不参与判定。',
       parameters: {
         evidence: {
           type: 'string',

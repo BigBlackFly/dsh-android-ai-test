@@ -138,15 +138,13 @@ def scan(xml_text: str, fg_package: str | None = None,
             continue
         v_iou = inter / (area_a + area_b - inter)
         v_contain = inter / smaller if smaller else 0.0
-        # 业务规则（2026-11-23 用户确认，两轮扩展）：
-        #   **可点控件、文本内容，都不允许互相重叠**——
-        #   语义内容节点（clickable 或带文本）两两之间交面积>0 即报，
-        #   不看 IoU 阈值（1px 相交也是 BUG，不接受「设计性紧凑布局」辩护）。
-        #   纯装饰叶子（无文本无可点的图标类）维持原阈值：
-        #   角标压图标/毛玻璃相交是设计常态，IoU 闸门防误报爆炸。
-        content_a = bool(a["clickable"] or a["text"])
-        content_b = bool(b["clickable"] or b["text"])
-        strict = content_a and content_b
+        # 业务规则（2026-11-25 收敛，防文字堆叠误判假 PASS/FAIL）：
+        #   **只有双可点控件堆叠才构成 FAIL 强信号**（strict）——
+        #   1px 相交即报，不接受「设计性紧凑布局」辩护。
+        #   文字/文本堆叠暂不作为 FAIL 标准：仍按普通 IoU 阈值呈现为坐标事实
+        #   （供 AI 结合截图参考），但不计 strict、不触发硬判定。
+        #   纯装饰叶子（无文本无可点）同样维持 IoU 阈值，防误报爆炸。
+        strict = bool(a["clickable"] and b["clickable"])
         if (v_iou > iou) or (strict and inter > 0):
             kind = "overlap"
         elif v_contain > contain:
@@ -164,14 +162,11 @@ def scan(xml_text: str, fg_package: str | None = None,
                                     "clickable", "center", "bounds")},
         })
 
-    # 严重度排序：双可点互压 > 其他语义内容互压 > overlap > contained；同型按 IoU 降序
+    # 严重度排序：双可点互压(strict) > overlap > contained；同型按 IoU 降序
     def _sev(h: dict) -> tuple:
-        both_click = (h["a"]["clickable"] and h["b"]["clickable"])
-        strict = ((h["a"]["clickable"] or h["a"]["text"])
-                  and (h["b"]["clickable"] or h["b"]["text"]))
-        return (0 if (both_click and h["kind"] == "overlap") else
-                1 if (strict and h["kind"] == "overlap") else
-                2 if h["kind"] == "overlap" else 3, -h["iou"])
+        strict = (h["a"]["clickable"] and h["b"]["clickable"])
+        return (0 if (strict and h["kind"] == "overlap") else
+                1 if h["kind"] == "overlap" else 2, -h["iou"])
     hits.sort(key=_sev)
     out["count"] = len(hits)
     out["strict_count"] = sum(1 for h in hits if h.get("strict"))
@@ -181,8 +176,69 @@ def scan(xml_text: str, fg_package: str | None = None,
     return out
 
 
+# 检测结果状态文件（可观测性记录，与证据目录同处；不参与任何判定）。
+# 每次调用 append 一条 run 记录，保留最新一条在 latest 字段，便于人直接查看。
+_STATE_NAME = "layout_check.json"
+_STATE_MAX_RUNS = 20
+
+
+def _append_state(directory: Path, record: dict) -> Path | None:
+    """把一次检测结果写入 <证据目录>/layout_check.json（latest + runs 历史）。
+    失败静默——记录是辅助能力，不许影响检测返回。"""
+    fp = directory / _STATE_NAME
+    try:
+        existing: dict = {}
+        if fp.is_file():
+            loaded = json.loads(fp.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                existing = loaded
+        runs = existing.get("runs") if isinstance(existing.get("runs"), list) else []
+        runs.append(record)
+        state = {
+            "latest": record,
+            "runs": runs[-_STATE_MAX_RUNS:],
+        }
+        fp.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+        return fp
+    except (OSError, ValueError, TypeError):  # noqa: BLE001
+        return None
+
+
+def _mark_boxes(step_dir: Path, overlaps: list[dict]) -> None:
+    """在问题现场截图上把命中区域画红框 + 编号，写 <step>/layout_boxes.png。
+
+    坐标系：dump bounds 与 shot.png 同为设备像素（含横屏 3840x2560，实测一致），
+    直接用 bounds 画框。框只标坐标事实，不标"异常/正常"——语义判定仍归 AI。
+    失败一律无痕跳过（截图缺失/Pillow 不可用），不影响检测主返回。
+    """
+    png = step_dir / "shot.png"
+    if not png.is_file():
+        return
+    try:
+        from PIL import Image, ImageDraw
+        img = Image.open(png).convert("RGB")
+        draw = ImageDraw.Draw(img)
+        iw, ih = img.size
+        for n, hit in enumerate(overlaps, 1):
+            for key in ("a", "b"):
+                x1, y1, x2, y2 = hit[key]["bounds"]
+                color = (220, 38, 38) if key == "a" else (255, 140, 0)
+                draw.rectangle([x1, y1, x2, y2], outline=color, width=6)
+            ax1, ay1, ax2, ay2 = hit["a"]["bounds"]
+            bx1, by1, bx2, by2 = hit["b"]["bounds"]
+            ix1, iy1, ix2, iy2 = max(ax1, bx1), max(ay1, by1), min(ax2, bx2), min(ay2, by2)
+            if ix1 < ix2 and iy1 < iy2:
+                draw.rectangle([ix1, iy1, ix2, iy2], outline=(220, 38, 38), width=10)
+                draw.text((min(ix1 + 4, iw - 30), min(max(iy1 - 2, 0), ih - 20)),
+                          str(n), fill=(220, 38, 38))
+        img.save(step_dir / "layout_boxes.png")
+    except Exception:  # noqa: BLE001 —— 可视化失败不影响主链路
+        pass
+
+
 def main() -> None:
-    from common import apply_stdin_args, emit, fail  # 延迟导入：scan 保持零依赖可测
+    from common import (CALL_ID, apply_stdin_args, emit, fail,
+                        log_auto, rel)  # 延迟导入：scan 保持零依赖可测
     p = argparse.ArgumentParser(description="layout_check：视图树堆叠检测（确定性事实）")
     p.add_argument("--xml", help="dump.xml 路径")
     p.add_argument("--evidence", help="证据目录路径（内含 dump.xml，与 --xml 二选一）")
@@ -258,6 +314,47 @@ def main() -> None:
     elif res["count"] == 0:
         payload["hint"] = ("视图树层面未检出控件堆叠。自绘内容（SurfaceView/Canvas）"
                            "不在视图树里，那类问题仍需视觉判定。")
+
+    # 可追溯性：① 事件入 events 表（与 act/observe/vision 同款，供 flaky_expects
+    # 跨轮比对「判定时检出了什么」）；② 状态回填证据目录供人直接查看。
+    # 两者都只记录事实，不参与判定、不触发任何强制逻辑。
+    try:
+        from datetime import datetime
+        record = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "call_id": CALL_ID,
+            "evidence": str(xml_fp.parent),
+            "dump": str(xml_fp),
+            "package": fg,
+            "pkg_found": res.get("pkg_found"),
+            "tree_blind": tree_blind,
+            "scanned": res["scanned"],
+            "count": res["count"],
+            "strict_count": res.get("strict_count", 0),
+            "overlaps": res["overlaps"],
+            "params": {"iou": args.iou, "contain": args.contain, "max": args.max},
+        }
+        state_fp = _append_state(xml_fp.parent, record)
+        if state_fp:
+            payload["state_file"] = str(state_fp)
+        # 问题现场：命中时在对应截图上把异常区域画红框（编号与 overlaps 对齐），
+        # 供人工回溯 + AI 用 android_vision 看图核对。纯可视化，不参与判定。
+        # 无截图/无命中/Pillow 缺失一律无痕跳过。
+        if res["overlaps"]:
+            _mark_boxes(xml_fp.parent, res["overlaps"])
+            boxes_fp = xml_fp.parent / "layout_boxes.png"
+            if boxes_fp.is_file():
+                payload["boxes_image"] = str(boxes_fp)
+        # 事件入表：detail 是人读摘要，data 存完整结果（flaky 分析可比对每轮检出）
+        eid = log_auto(
+            "layout_check", "layout_check",
+            f"layout check: count={res['count']} strict={record['strict_count']}"
+            f" pkg={fg or '-'} blind={'Y' if tree_blind else 'N'}",
+            record, rel(xml_fp), None, None)
+        if eid:
+            payload["event_id"] = eid
+    except Exception:  # noqa: BLE001 —— 记录失败不影响主返回
+        pass
     emit(True, payload)
 
 
