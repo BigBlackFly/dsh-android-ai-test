@@ -6,6 +6,7 @@
   python act.py input --x 540 --y 1200 --text "你好" --via text="确定" --name ...
   python act.py input --x 540 --y 1200 --text "追加内容" --no-click --append --name ...
   python act.py swipe --from 540,2000 --to 540,800 --dur 300 --watch text="允许" --name ...
+  python act.py drag --from 300,1200 --to 800,1200 --dur 500 --name ...
   python act.py back --why "关闭二级页" --name ...
   python act.py home --name ...
   python act.py recents --name ...             # 打开多任务（最近任务）
@@ -14,7 +15,7 @@
 语义说明：
 - input 默认会先 click 目标坐标聚焦输入框（AI 已点过输入框时加 --no-click 避免
   双击副作用）；默认 clear=True 覆盖已有内容，追加用 --append。
-- --watch：动作后监听瞬态弹窗并立即点击（tap/longclick/input/swipe 均支持），
+- --watch：动作后监听瞬态弹窗并立即点击（tap/longclick/input/swipe/drag 均支持），
   多候选用 | 分隔；决策在挂载时完成，弹窗出现亚秒级响应，不经 AI。
 - --via 定位依据溯源（链路卡提炼靠它）；--why 本步理由（时间轴展示）。
 - --settle 动作后稳定窗口毫秒数（默认 500）。异步渲染页（联网解析等）AI 应
@@ -212,6 +213,15 @@ def main() -> None:
     s.add_argument("--watch", default=None)
     s.add_argument("--watch-timeout", type=int, default=8000, dest="watch_timeout", help="watch 总窗口毫秒（系统权限框约6s自行消失）")
 
+    s = sub.add_parser("drag")
+    s.add_argument("--from", dest="src", required=True, help="x1,y1")
+    s.add_argument("--to", dest="dst", required=True, help="x2,y2")
+    s.add_argument("--dur", type=int, default=300, help="长按目标之后的拖动时间（毫秒），默认 300")
+    s.add_argument("--via", default=None)
+    s.add_argument("--why", default=None)
+    s.add_argument("--watch", default=None)
+    s.add_argument("--watch-timeout", type=int, default=8000, dest="watch_timeout", help="watch 总窗口毫秒（系统权限框约6s自行消失）")
+
     for name in ("back", "home", "recents"):
         s = sub.add_parser(name)
         s.add_argument("--why", default=None, help="这一步的理由（入库展示在时间轴）")
@@ -300,6 +310,11 @@ def main() -> None:
             x2, y2 = xy(args.dst)
             timed_call("action", d.swipe, x1, y1, x2, y2, args.dur / 1000)
             action = {"type": "swipe", "from": [x1, y1], "to": [x2, y2], "dur_ms": args.dur}
+        elif args.action == "drag":
+            x1, y1 = xy(args.src)
+            x2, y2 = xy(args.dst)
+            timed_call("action", d.drag, x1, y1, x2, y2, args.dur / 1000)
+            action = {"type": "drag", "from": [x1, y1], "to": [x2, y2], "dur_ms": args.dur}
         elif args.action == "back":
             timed_call("action", d.press, "back")
             action = {"type": "back"}
@@ -340,6 +355,8 @@ def main() -> None:
                   + ("（追加）" if getattr(args, "append", False) else ""))
     elif args.action == "swipe":
         detail = f"滑动 {args.src} → {args.dst}"
+    elif args.action == "drag":
+        detail = f"拖动 {args.src} → {args.dst}"
     elif args.action == "back":
         detail = "返回"
     elif args.action == "home":

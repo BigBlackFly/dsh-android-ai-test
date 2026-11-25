@@ -251,12 +251,12 @@ export function apply(ctx, config = {}) {
     defineTool({
       name: 'android_act',
       description:
-        '在真机上执行一个动作（tap / longclick / input / swipe / back / home / recents / key），执行后自动返回动作后的画面（截图 + UI 树 + 可点清单 next）。参数是结构化 JSON，不走 shell 解析。',
+        '在真机上执行一个动作（tap / longclick / input / swipe / drag / back / home / recents / key），执行后自动返回动作后的画面（截图 + UI 树 + 可点清单 next）。参数是结构化 JSON，不走 shell 解析。drag 直接调用设备拖动能力，dur 表示拖动持续时间，不额外增加长按阶段。',
       parameters: {
         action: {
           type: 'string',
           required: true,
-          enum: ['tap', 'longclick', 'input', 'swipe', 'back', 'home', 'recents', 'key'],
+          enum: ['tap', 'longclick', 'input', 'swipe', 'drag', 'back', 'home', 'recents', 'key'],
           description: '动作类型',
         },
         x: { type: 'number', description: 'tap/longclick/input 的 x 坐标' },
@@ -278,9 +278,9 @@ export function apply(ctx, config = {}) {
           description:
             'input 动作要输入的文字。传空字符串 "" = 清空输入框（默认覆盖式输入，不需要先删）',
         },
-        from: { type: 'string', description: 'swipe 起点，形如 540,2000' },
-        to: { type: 'string', description: 'swipe 终点，形如 540,800' },
-        dur: { type: 'number', description: 'swipe 时长毫秒' },
+        from: { type: 'string', description: 'swipe/drag 的起点，形如 540,2000' },
+        to: { type: 'string', description: 'swipe/drag 的终点，形如 540,800' },
+        dur: { type: 'number', description: 'swipe/drag 的滑动时长，单位为毫秒' },
         repeat: {
           type: 'number',
           description: '重复次数（仅 tap），用于滚轮连点',

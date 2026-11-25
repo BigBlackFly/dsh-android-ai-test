@@ -41,3 +41,7 @@ jira_config.json
 
 # 本机踩坑记录这类文件不入包（2026-11-10 用户裁定）
 Linux安装记录.md
+
+# 本地的coding agent依赖不入包
+AGENTS.md
+devdocs/
