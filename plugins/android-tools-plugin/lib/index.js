@@ -251,13 +251,32 @@ export function apply(ctx, config = {}) {
     defineTool({
       name: 'android_act',
       description:
-        '在真机上执行一个动作（tap / longclick / input / swipe / drag / back / home / recents / key），执行后自动返回动作后的画面（截图 + UI 树 + 可点清单 next）。参数是结构化 JSON，不走 shell 解析。drag 直接调用设备拖动能力，dur 表示拖动持续时间，不额外增加长按阶段。',
+        '在真机上执行一个动作（tap / longclick / input / swipe / drag / multi_stage_swipe / back / home / recents / key），结束后返回截图、UI 树和 next。参数是结构化 JSON，不走 shell 解析。\n'+
+        'multi_stage_swipe 用于执行单手指的复杂滑动，支持连续转向、在起点或途中停留。工具自动按下和松手，执行结束后取证，中途不取证。\n'+
+        'drag 会先执行长按，然后保持手指按压状态开始移动；drag 的 dur 参数仅表示移动时长，不包含长按时间。\n'
       parameters: {
         action: {
           type: 'string',
           required: true,
-          enum: ['tap', 'longclick', 'input', 'swipe', 'drag', 'back', 'home', 'recents', 'key'],
+          enum: ['tap', 'longclick', 'input', 'swipe', 'drag', 'multi_stage_swipe', 'back', 'home', 'recents', 'key'],
           description: '动作类型',
+        },
+        start: {
+          type: 'string',
+          description: '仅 multi_stage_swipe 必填：起点整数像素坐标，形如 300,1200。自动在此按下，所有阶段结束才松手。',
+        },
+        stages: {
+          type: 'array',
+          description: '仅 multi_stage_swipe 必填：按顺序执行 move/hold。move 从当前位置移到 to；hold 原地保持按住。每段必须填写正整数 dur（毫秒），无默认值。例：[{"type":"hold","dur":700},{"type":"move","to":"800,1200","dur":500}]。全程不抬手、不采集过程画面。',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              type: { type: 'string', required: true, enum: ['move', 'hold'], description: 'move 移动，hold 保持按住' },
+              to: { type: 'string', description: 'move 必填，hold 禁用；终点整数像素坐标 x,y' },
+              dur: { type: 'integer', required: true, description: '本阶段目标耗时，正整数毫秒（≥1），必填' },
+            },
+          },
         },
         x: { type: 'number', description: 'tap/longclick/input 的 x 坐标' },
         y: { type: 'number', description: 'tap/longclick/input 的 y 坐标' },
@@ -329,7 +348,36 @@ export function apply(ctx, config = {}) {
         ],
       },
       async execute(args, exec) {
+        if (args.action === 'multi_stage_swipe') {
+          const allowed = new Set(['action', 'start', 'stages', 'via', 'why', 'name', 'expect', 'settle', 'serial', 'full'])
+          const mixed = Object.keys(args).filter((key) => !allowed.has(key))
+          if (typeof args.start !== 'string' || !Array.isArray(args.stages) || !args.stages.length || mixed.length) {
+            return { ok: false, rejected: true, execution_state: 'not_executed',
+              error: mixed.length ? `multi_stage_swipe 不接受顶层参数: ${mixed.join(', ')}`
+                : 'multi_stage_swipe 必须提供 start="x,y" 和非空 stages 数组' }
+          }
+          // ★ 参数合法性校验：
+          //     · move 必须带 to，hold 不许带 to
+          //     · dur 必须是 ≥1 的整数
+          const badStage = args.stages.findIndex((stage) => {
+            if (stage === null || typeof stage !== 'object' || Array.isArray(stage)) return true
+            if (!Number.isInteger(stage.dur) || stage.dur < 1) return true
+            if (stage.type === 'move') return typeof stage.to !== 'string' || stage.to === ''
+            if (stage.type === 'hold') return stage.to !== undefined
+            return true
+          })
+          if (badStage >= 0) {
+            return { ok: false, rejected: true, execution_state: 'not_executed',
+              error: `multi_stage_swipe stages[${badStage}] 不合法：move 必须带 to，hold 不许带 to，dur 必须是 ≥1 的整数` }
+          }
+        } else if (args.start !== undefined || args.stages !== undefined) {
+          return { ok: false, rejected: true, execution_state: 'not_executed',
+            error: 'start/stages 仅用于 multi_stage_swipe' }
+        }
         const rest = [String(args.action || '')]
+        if (args.action === 'multi_stage_swipe') {
+          rest.push('--start', args.start, '--stages', JSON.stringify(args.stages))
+        }
         const push = (flag, value) => {
           if (value !== undefined && value !== null && value !== '') {
             rest.push(flag, String(value))
