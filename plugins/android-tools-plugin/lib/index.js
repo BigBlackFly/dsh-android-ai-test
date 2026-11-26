@@ -253,7 +253,7 @@ export function apply(ctx, config = {}) {
       description:
         '在真机上执行一个动作（tap / longclick / input / swipe / drag / multi_stage_swipe / back / home / recents / key），结束后返回截图、UI 树和 next。参数是结构化 JSON，不走 shell 解析。\n'+
         'multi_stage_swipe 用于执行单手指的复杂滑动，支持连续转向、在起点或途中停留。工具自动按下和松手，执行结束后取证，中途不取证。\n'+
-        'drag 会先执行长按，然后保持手指按压状态开始移动；drag 的 dur 参数仅表示移动时长，不包含长按时间。\n'
+        'drag 会先执行长按，然后保持手指按压状态开始移动；drag 的 dur 参数仅表示移动时长，不包含长按时间。\n',
       parameters: {
         action: {
           type: 'string',
