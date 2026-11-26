@@ -495,7 +495,7 @@
                             ## 你有的工具
 
                             · android_env       —— 环境探测（开工第一条）
-                            · android_act       —— 动手（tap / longclick / input / swipe / drag / back / home / key）
+                            · android_act       —— 动手（tap / longclick / input / swipe / drag / multi_stage_swipe / back / home / key）
                             · android_observe   —— 看屏（前台 activity + 可点清单 next）
                             · android_read      —— **OCR，只读文字**
                             · android_vision    —— **视觉模型，读图标/颜色/布局**
@@ -592,9 +592,21 @@
                             android_act(action="input", x=1520, y=375, text="", via="rid=et_name")   # 清空
                             android_act(action="swipe", from="540,2000", to="540,800", dur=300)
                             android_act(action="drag", from="300,1200", to="800,1200", dur=500)
+                            android_act(action="multi_stage_swipe", start="300,1200", stages=[
+                              {"type":"hold","dur":700},
+                              {"type":"move","to":"800,1200","dur":500},
+                              {"type":"hold","dur":1000},
+                              {"type":"move","to":"800,600","dur":400}
+                            ], why="按住目标，经 A 点停留后拖到 B 点")
                             android_act(action="back")             # 返回；home / recents 也是 act 的动作
                             android_read(region="0,200,3040,600")
                             ```
+
+                            **单手指多段滑动**：如果需要单根手指执行一段连续的复杂轨迹操作，中途手指不抬起，例如手指按下后，途中停留、移动、转向，最后抬起，那么就用 multi_stage_swipe。
+                            start/to 都用 "x,y" 整数像素字符串；move 必填 to，hold 不填坐标；
+                            每段 dur 必填正整数毫秒。move → hold 表示先滑后停，hold → move 表示先按住再滑。
+                            自动按下和松手，全程一次调用，仅松手后取证；不能中途看结果再决定下一段。
+                            hold 仅表示保持触摸，不保证应用识别为长按。
 
                             **参数是结构化 JSON，不走 shell 解析** —— 所以：
 

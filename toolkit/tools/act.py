@@ -17,6 +17,8 @@
   双击副作用）；默认 clear=True 覆盖已有内容，追加用 --append。
 - --watch：动作后监听瞬态弹窗并立即点击（tap/longclick/input/swipe/drag 均支持），
   多候选用 | 分隔；决策在挂载时完成，弹窗出现亚秒级响应，不经 AI。
+- multi_stage_swipe：--start x,y 和 --stages JSON 数组（move/hold，每段必填 dur 毫秒）。
+  一次按下、连续移动/停留、最终松手，只在松手后采集证据。
 - --via 定位依据溯源（链路卡提炼靠它）；--why 本步理由（时间轴展示）。
 - --settle 动作后稳定窗口毫秒数（默认 500）。异步渲染页（联网解析等）AI 应
   按知识卡经验加大，而不是靠反复 observe 轮询堆证据。
@@ -36,6 +38,7 @@ from common import (add_common_args, add_common_args_all_subcommands, apply_stdi
                     connect, emit, evidence_paths, fail, guard_terminated,
                     log_auto, rel, summarize_xml, texts_payload)
 import checkpoint
+from multi_stage_swipe import parse_swipe, check_bounds, run_swipe
 
 
 
@@ -222,6 +225,13 @@ def main() -> None:
     s.add_argument("--watch", default=None)
     s.add_argument("--watch-timeout", type=int, default=8000, dest="watch_timeout", help="watch 总窗口毫秒（系统权限框约6s自行消失）")
 
+    s = sub.add_parser("multi_stage_swipe")
+    s.add_argument("--start", required=True, help="起点 x,y，整数像素")
+    s.add_argument("--stages", required=True,
+                   help='JSON 数组：{"type":"move","to":"x,y","dur":500} 或 {"type":"hold","dur":700}')
+    s.add_argument("--via", default=None)
+    s.add_argument("--why", default=None)
+
     for name in ("back", "home", "recents"):
         s = sub.add_parser(name)
         s.add_argument("--why", default=None, help="这一步的理由（入库展示在时间轴）")
@@ -235,6 +245,17 @@ def main() -> None:
     _reject_selector_misuse(p)
     apply_stdin_args()   # 支持 --stdin-json（参数走 stdin，避开 Windows 引号问题）
     args = p.parse_args()
+    swipe_spec = None
+    if args.action == "multi_stage_swipe":
+        try:
+            raw_stages = json.loads(args.stages)
+            swipe_spec = parse_swipe(args.start, raw_stages, xy)
+            if args.settle < 0:
+                raise ValueError("settle 必须为非负毫秒数")
+            if args.perm_action is not None or args.perm is not None:
+                raise ValueError("multi_stage_swipe 不接受 permAction/perm")
+        except (ValueError, TypeError) as error:
+            fail(str(error), rejected=True)
     guard_terminated(f"act {args.action}")   # 会话已因崩溃终止 → 拒绝执行
     via = getattr(args, "via", None)
     why = getattr(args, "why", None)
@@ -282,6 +303,12 @@ def main() -> None:
     except Exception as e:  # noqa: BLE001
         fail(f"设备连接失败: {e}")
 
+    if swipe_spec is not None:
+        try:
+            check_bounds(*swipe_spec, d.window_size())
+        except Exception as error:
+            fail(f"multi_stage_swipe 准备失败，未执行: {error}", rejected=True)
+
     t0 = time.perf_counter()
     started_at = datetime.now().isoformat(timespec="milliseconds")
     execution("may_have_executed")
@@ -315,6 +342,9 @@ def main() -> None:
             x2, y2 = xy(args.dst)
             timed_call("action", d.drag, x1, y1, x2, y2, args.dur / 1000)
             action = {"type": "drag", "from": [x1, y1], "to": [x2, y2], "dur_ms": args.dur}
+        elif args.action == "multi_stage_swipe":
+            timed_call("action", run_swipe, d, *swipe_spec)
+            action = {"type": "multi_stage_swipe", "start": args.start, "stages": raw_stages}
         elif args.action == "back":
             timed_call("action", d.press, "back")
             action = {"type": "back"}
@@ -357,6 +387,8 @@ def main() -> None:
         detail = f"滑动 {args.src} → {args.dst}"
     elif args.action == "drag":
         detail = f"拖动 {args.src} → {args.dst}"
+    elif args.action == "multi_stage_swipe":
+        detail = f"连续滑动 {args.start} · {len(raw_stages)} 段"
     elif args.action == "back":
         detail = "返回"
     elif args.action == "home":
