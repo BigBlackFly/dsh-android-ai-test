@@ -520,7 +520,10 @@ async function viewSessions() {
           <span class="c-act">
             <button class="ghost sm" data-replay="${esc(s.id)}"
               ${s.has_evidence ? "" : "disabled"}
-              title="${s.has_evidence ? "回放本次执行的轨迹（截图串播）" : "该记录没有可用的截图，无法回放"}">▶ 回放</button>
+              title="${s.has_evidence ? "回放本次执行的轨迹（截图串播）" : "该记录没有可用的截图，无法回放"}">▶ 轨迹回放</button>
+            <button class="ghost sm" data-video-replay="${esc(s.id)}"
+              ${s.has_video ? "" : "disabled"}
+              title="${s.has_video ? "播放本次执行录屏" : "该记录没有可用录屏"}">▶ 录屏回放</button>
             <button class="ghost sm danger" data-del="${esc(s.id)}" title="删除该记录及其截图/日志">删除</button>
           </span>
         </div>`).join("") || (q
@@ -575,6 +578,11 @@ async function viewSessions() {
     el.addEventListener("click", ev => {
       ev.stopPropagation();
       replaySession(el.dataset.replay);
+    }));
+  $$(`[data-video-replay]`, main).forEach(el =>
+    el.addEventListener("click", ev => {
+      ev.stopPropagation();
+      replayVideoSession(el.dataset.videoReplay);
     }));
 
   // 批量删除
@@ -896,6 +904,49 @@ async function replaySession(id) {
   show(0);
 }
 
+async function replayVideoSession(id) {
+  let data;
+  try { data = await api(`/api/sessions/${encodeURIComponent(id)}/video`); }
+  catch (e) { toast(`录屏加载失败：${e.message}`); return; }
+  const segments = data.segments || [];
+  if (!segments.length) { toast("这条记录没有可播放的录屏"); return; }
+  const opts = segments.map((s, i) => `<option value="${i}">片段 ${i + 1} · ${esc(fmtTime(s.started_at))}</option>`).join("");
+  const m = modal(`录屏回放 · ${esc(data.title || "测试记录")}`, `
+    <div class="video-replay">
+      <video class="video-replay-player" controls playsinline preload="metadata"></video>
+      <div class="video-replay-tools">
+        <label>录屏片段 <select class="video-replay-segments">${opts}</select></label>
+        <label>播放速度 <select class="video-replay-speed">
+          <option value="0.5">0.5×</option><option value="0.75">0.75×</option>
+          <option value="1" selected>1×</option><option value="1.25">1.25×</option>
+          <option value="1.5">1.5×</option><option value="2">2×</option>
+        </select></label>
+        <span class="muted">共 ${segments.length} 段</span>
+      </div>
+    </div>`);
+  const panel = m.el.querySelector(".modal");
+  panel.classList.add("video-replay-modal");
+  makeDraggable(panel);
+  const player = $(".video-replay-player", m.el);
+  const select = $(".video-replay-segments", m.el);
+  const speed = $(".video-replay-speed", m.el);
+  speed.addEventListener("change", () => { player.playbackRate = Number(speed.value); });
+  const playSegment = i => {
+    const segment = segments[i];
+    if (!segment) return;
+    player.src = segment.url;
+    player.playbackRate = Number(speed.value);
+    select.value = String(i);
+    player.play().catch(() => {});
+  };
+  select.addEventListener("change", () => playSegment(Number(select.value)));
+  player.addEventListener("ended", () => {
+    const next = Number(select.value) + 1;
+    if (next < segments.length) playSegment(next);
+  });
+  playSegment(0);
+}
+
 /**
  * 断言下面的「证据」行。
  *
@@ -948,8 +999,12 @@ async function viewSession(id) {
 
   main.innerHTML = `
     <button class="ghost back">← 返回列表</button>
-    <button class="ghost" data-replay="${s.id}" ${hasEv ? "" : "disabled"}
-      title="${hasEv ? "回放本次执行的轨迹（截图串播）" : "该记录没有可用的截图，无法回放"}">▶ 回放轨迹</button>
+    <div class="session-playback-actions">
+      <button class="ghost" data-replay="${s.id}" ${hasEv ? "" : "disabled"}
+        title="${hasEv ? "回放本次执行的轨迹（截图串播）" : "该记录没有可用的截图，无法回放"}">▶ 轨迹回放</button>
+      <button class="ghost" data-video-replay="${s.id}" ${s.has_video ? "" : "disabled"}
+        title="${s.has_video ? "播放本次执行录屏" : "该记录没有可用录屏"}">▶ 录屏回放</button>
+    </div>
     <div class="detail-head">
       <h1>${esc(s.title || `会话 #${s.id}`)} ${statusChip(s.status)}</h1>
       <div class="meta">模块 ${esc(s.package || "—")} · 设备 ${esc(s.device || "—")} ·
@@ -1012,6 +1067,8 @@ async function viewSession(id) {
   $(".back", main).addEventListener("click", viewSessions);
   const rpBtn = $("[data-replay]", main);
   if (rpBtn) rpBtn.addEventListener("click", () => replaySession(s.id));
+  const videoBtn = $("[data-video-replay]", main);
+  if (videoBtn) videoBtn.addEventListener("click", () => replayVideoSession(s.id));
   $$("img.shot", main).forEach(img =>
     img.addEventListener("click", () => {
       $("#lightbox-img").src = img.src;

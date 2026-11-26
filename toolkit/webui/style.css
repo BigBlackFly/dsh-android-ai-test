@@ -386,9 +386,11 @@ button:disabled { opacity: .5; cursor: default; }
    风格：**所有列（表头 + 数据）统一居中**。
    列宽按内容实测确定；标题列设上限 230px，避免 1fr 独吞剩余空间。 */
 .list-table.recs .lt-head, .list-table.recs .lt-row {
-  grid-template-columns: 36px 44px minmax(140px, 230px) 68px 88px
-                         120px 68px 88px 120px;
+  grid-template-columns: 30px 38px minmax(140px, 230px) 62px 78px
+                         112px 58px 92px minmax(245px, 270px);
 }
+.list-table.recs { overflow-x: auto; }
+.list-table.recs .lt-head, .list-table.recs .lt-row { min-width: 1040px; }
 /* 勾选框列：垂直居中（checkbox 是行内替换元素，text-align 管不了纵向） */
 .list-table.recs .c-chk { display: flex; align-items: center; justify-content: center; }
 .list-table.recs .c-chk input { cursor: pointer; }
@@ -404,6 +406,18 @@ button:disabled { opacity: .5; cursor: default; }
 .list-table.recs .lt-head .c-act { text-align: center; }
 .lt-row .c-act { overflow: visible; }
 .lt-row .c-act button { white-space: nowrap; }
+.list-table.recs .lt-row .c-act { gap: 4px; }
+.list-table.recs .lt-row .c-act button { padding: 5px 8px; font-size: 11.5px; }
+.session-playback-actions { display: flex; align-items: center; gap: 8px; margin: 0 0 12px; }
+.video-replay { display: flex; flex-direction: column; gap: 12px; }
+.video-replay-player { width: 100%; max-height: 72vh; background: #111; border-radius: 8px; }
+.video-replay-tools { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.video-replay-tools label { display: flex; align-items: center; gap: 8px; }
+.video-replay-tools select { padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--card); color: var(--text); }
+.modal.video-replay-modal { width: min(760px, 90vw); max-height: 90vh; overflow: auto; will-change: transform; }
+.modal.video-replay-modal .modal-head { cursor: move; touch-action: none; user-select: none; }
+.modal.video-replay-modal.dragging { box-shadow: 0 18px 56px rgba(16,24,40,.34); transition: none; }
+.video-replay-player { max-height: 68vh; object-fit: contain; }
 .lt-row.diag { background: var(--bg3); }
 .lt-row.diag .c-title { font-weight: 500; }
 .tag-diag {
@@ -464,10 +478,12 @@ button.ghost.danger:hover { background: var(--fail-soft); }
 /* 结论筛选第二行：与表格同款 9 列网格（列宽和 gap 必须一致，否则列位错开） */
 .rec-toolbar2 {
   display: grid;
-  grid-template-columns: 36px 44px minmax(140px, 230px) 68px 88px
-                         120px 68px 88px 120px;
+  grid-template-columns: 30px 38px minmax(140px, 230px) 62px 78px
+                         112px 58px 92px minmax(245px, 270px);
   gap: 12px; align-items: center; margin: -4px 0 14px;
 }
+.rec-toolbar2 .rec-filters { grid-column: 1 / 9; }
+.rec-toolbar2 .rec-batch-del { grid-column: 9; justify-self: center; }
 .rec-flt-label { margin: 0; white-space: nowrap; }
 /* 状态筛选按钮：复用 chip 配色，默认描边态；选中后填充同色 */
 .stab {
