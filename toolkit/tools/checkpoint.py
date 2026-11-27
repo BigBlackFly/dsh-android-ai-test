@@ -23,6 +23,19 @@ try:
 except Exception:  # noqa: BLE001  common 不可用时不要因此崩掉
     pass
 
+# `--expect` 认识的键。**列表之外的键一律不认**，但要报出来而不是丢掉 ——
+# 静默丢掉会让「我写了检查点」和「我没写检查点」在结果上完全一样。
+EXPECT_KEYS = ("activity", "rid", "text", "desc")
+
+
+class ExpectSpecError(ValueError):
+    """`--expect` 里出现了无法生效的内容（未知键 / 缺等号 / 空值）。
+
+    抛出来而不是静默忽略：检查点写错时最坏的结果是「看着验了、其实没验」，
+    而那一步的判定会被当成可信结论写进 finding。
+    """
+
+
 def parse_expect(spec: str | None) -> dict:
     """把 `--expect` 的字符串解析成条件字典。
 
@@ -32,21 +45,36 @@ def parse_expect(spec: str | None) -> dict:
         text=完成
         activity=TimetableActivity,rid=btnCreateManually   （逗号分隔 = AND）
         activity=TimeSlotSettingsActivity|TimetableActivity （竖线 = 任一，OR）
+
+    无法生效的分段会抛 `ExpectSpecError`，不再静默 `continue`。
     """
     if not spec or not spec.strip():
         return {}
     conds: dict[str, list[str]] = {}
+    bad: list[str] = []
     for part in spec.split(","):
         part = part.strip()
-        if not part or "=" not in part:
+        if not part:
+            continue
+        if "=" not in part:
+            bad.append(f"{part}（缺少 =，写成 键=值）")
             continue
         key, _, val = part.partition("=")
-        key = key.strip().lower()
-        if key not in ("activity", "rid", "text", "desc"):
+        key_raw = key.strip()
+        key = key_raw.lower()
+        if key not in EXPECT_KEYS:
+            bad.append(f"{key_raw}（只认 {'/'.join(EXPECT_KEYS)}）")
             continue
         vals = [v.strip() for v in val.split("|") if v.strip()]
-        if vals:
-            conds.setdefault(key, []).extend(vals)
+        if not vals:
+            bad.append(f"{key_raw}=（值为空）")
+            continue
+        conds.setdefault(key, []).extend(vals)
+    if bad:
+        raise ExpectSpecError(
+            "检查点写法无效：" + "；".join(bad)
+            + f"。只支持 {'/'.join(EXPECT_KEYS)} 四种键，逗号分隔 = AND，"
+              "竖线分隔 = 任一。示例：--expect activity=XxxActivity,rid=btn_ok")
     return conds
 
 
@@ -56,6 +84,9 @@ def evaluate(expect: dict, *, activity: str | None, sig: list[str] | None,
 
     返回 {"checked": bool, "ok": bool, "matched": [...], "missed": [...]}
     `checked=False` 表示没给期望（不校验）。
+
+    ⚠️ `checked=False` **不等于通过** —— 它只表示「没写检查点」。
+    调用方要区分「验了且过了」和「压根没验」，不能都当成 ok。
     """
     if not expect:
         return {"checked": False, "ok": True, "matched": [], "missed": []}

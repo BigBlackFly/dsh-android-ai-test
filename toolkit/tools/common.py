@@ -320,16 +320,26 @@ def _card_keywords(card: Path) -> list[str]:
 
     用途见 knowledge_hint 的 cross_cards 分支。
 
-    ⚠️ 必须显式剥掉 `.md` 后缀：`\\b(com\\.[a-z0-9_.]+)\\b` 会把后缀一起吞进
-    包名（得到 ``com.zui.calendar.md``），拼出来的路径必然不存在，
-    于是**跨卡指路静默失效**。
+    ⚠️ 正则陷阱（真事故：这段写过两版都失效，样式不同、病因相同）：
+      - 不带 `\\.md` 分支 → `com.zui.calendar.md` 被整串吞进包名，拼出的路径
+        必然不存在，**跨卡指路静默失效**；
+      - 加了 `(?:\\.md)?` 但用**非贪婪** `+?` → 正则只要「能匹配就算成功」，
+        非贪婪会退到最短可匹配长度，于是 `com.zui.calendar` 只吃到 `com.zui`，
+        `.calendar` 没人要。实测 6 张真实卡全部产出 `['com.zui']` /
+        `['com.android']`，**cross_cards 恒为空**，比第一版更隐蔽。
+    现在的写法：包名用贪婪 `+`，后缀用**前瞻** `(?=\\.md\\b|\\b)` 断言边界。
+    但前瞻里的 `\\b` 在 `com.zui.calendar.md` 上**不成立**（`.` 与 `m` 两侧
+    都是非单词字符），只有 `\\.md\\b` 那条能过，而前瞻不消耗字符 → 命中的
+    末尾仍是 `.md` 前面，原始 match 会带回 `.md`。所以**必须再显式剥一次后缀**，
+    光靠正则不够。这两层都要留着，改前先跑 6 张真实卡验证：
+    期望 `com.zui.calendar.md` → `['com.zui.calendar']`。
     """
     try:
         text = card.read_text(encoding="utf-8")
     except OSError:
         return []
-    found = re.findall(r"\b((?:com|android)\.[a-z0-9_.]+?)(?:\.md)?\b", text)
-    return [f for f in found]
+    found = re.findall(r"\b((?:com|android)\.[a-z0-9_]+(?:\.[a-z0-9_]+)*)(?=\.md\b|\b)", text)
+    return [f[:-3] if f.endswith(".md") else f for f in found]
 
 
 def _sections_matching(sections: list[str], screen: str | None) -> list[str]:
@@ -468,7 +478,31 @@ def _system_card_hint() -> dict:
     }
 
 
-def knowledge_hint(package: str | None, shown: bool = False,
+def knowledge_hint_key(package: str | None, screen: str | None = None) -> str:
+    """知识卡浮现的**去重键**：同一个键在一个会话里只提示一次。
+
+    ★ N-05：原来去重单位是「整个会话」（`sessions.knowledge_shown` 一个布尔）。
+    实测真库 418/427 个会话都是「提示过一次就永久静默」—— `start` 时提示了
+    被测包的卡，之后跑到 `com.android.settings`（也有专属卡）时不再提示，
+    AI 就只能靠猜。`_system.md` 里写的口径一直是「按前台包读卡」。
+
+    所以键按**卡**来算：
+      · 有专属卡 → `card:<包名>`，每个包各提示一次；
+      · 无专属卡 → `system`，那句「本包暂无专属卡，系统界面看 system_card」
+        整个会话只提一次就够了（它对哪个无卡包都一样）。
+
+    `screen` 目前**不**参与键：同一 App 内换 activity 很频繁（弹窗、编辑页），
+    把 activity 拼进键会让提示反复出现、把省下来的 token 全还回去；
+    而同一包卡里的小节是同一批，重复给索引没有新信息。
+    保留该参数是为了签名稳定，将来若要按屏提示只改这里。
+    """
+    if not package:
+        return ""
+    card = KNOWLEDGE_DIR / f"{package}.md"
+    return f"card:{package}" if card.is_file() else "system"
+
+
+def knowledge_hint(package: str | None, shown_keys: set[str] | None = None,
                    screen: str | None = None) -> dict | None:
     """知识卡浮现：告诉 AI"这个包有卡、卡里有哪些小节"。
 
@@ -479,17 +513,21 @@ def knowledge_hint(package: str | None, shown: bool = False,
     设计取舍：
     - **只给标题、不给行号**：卡片会持续编辑，行号是易腐数据；
       AI 拿到标题再 `grep -n` 定位即可（两步都很便宜）。
-    - **只提示一次**（shown=True 时直接返回 None）：索引本身也占 token，
-      每步都带会把前面压 nodes 省下的又还回去。
+    - **每个卡键只提示一次**（`shown_keys` 里已有该键时直接返回 None）：
+      索引本身也占 token，每步都带会把前面压 nodes 省下的又还回去。
+      键的粒度见 `knowledge_hint_key` —— 按**卡**算，不是按会话算。
 
     `screen` 传当前前台 activity 时，会把与当前屏幕相关的小节**置顶到
     `sections_relevant`**（见 _sections_matching），并在 `cross_cards` 里
     指出"别家卡里也写了本界面相关内容"——针对 2026-10-14 那次
     "知识在日历卡、界面却属于 launcher，按包找卡找错"的真实教训。
 
-    返回 None 表示：无包名 / 无卡 / 已提示过。
+    返回 None 表示：无包名 / 该卡键已提示过。
     """
-    if not package or shown:
+    if not package:
+        return None
+    key = knowledge_hint_key(package, screen)
+    if key and shown_keys and key in shown_keys:
         return None
     card = KNOWLEDGE_DIR / f"{package}.md"
     if not card.is_file():
@@ -583,6 +621,39 @@ _EXPECT_ITEM_RE = re.compile(r"^\s*(\d{1,3}(?:\s*[-~－～]\s*\d{1,3})?)\s*[.．
 # ②数字后面紧跟的必须是汉字。
 _EXPECT_BARE_NUM_RE = re.compile(r"^\s*([1-9])(?![\d.．、])\s*(?=[\u4e00-\u9fff])")
 
+# ★ N-31：版本分支标记。真实用例「启动应用_03」的预期段长这样：
+#     预期结果：
+#     【16.0：
+#     1.日历弹框内容：…
+#     2.点击退出退出应用，…
+#     】
+#     【16.1：1.日历CTA弹框内容：
+#     …
+#     2.点击退出，退出应用，…】
+# 这些 `【16.x：` / `】` 是**版本标注**，不是预期内容。原来它们被当成正文：
+# `【16.0：` 开了一条空壳预期（label=''、text='【16.0：'），`【16.1：`
+# 又黏在第 3 条末尾 —— 04 个条目里 1 条是垃圾、2 条把两版内容混在一起，
+# AI 按「1 预期 = 1 finding」记就会多记并错记。
+_VERSION_OPEN_RE = re.compile(r"^【\s*\d+(?:\.\d+)*\s*[：:]\s*")
+_VERSION_CLOSE_ONLY_RE = re.compile(r"^[】\]\s]+$")
+_VERSION_TRAIL_RE = re.compile(r"[】\]]+\s*$")
+
+
+def _strip_version_marks(line: str) -> str:
+    """剥掉版本分支标记，返回剩下的正文（可能为空串）。
+
+    `【16.0：` → `""` 、`【16.1：1.日历CTA…` → `1.日历CTA…`、
+    `…即可获取对应权限】` → `…即可获取对应权限`。
+    最多剥 3 层（`【16.0：【16.1：…` 这种畸形输入不该把循环卡住）。
+    """
+    out = (line or "").strip()
+    for _ in range(3):
+        nxt = _VERSION_OPEN_RE.sub("", out, count=1)
+        if nxt == out:
+            break
+        out = nxt.strip()
+    return _VERSION_TRAIL_RE.sub("", out).strip()
+
 
 def split_case_expectations(text: str) -> list[dict]:
     """把用例原文的「预期结果」段切成**有序预期列表**。
@@ -619,9 +690,17 @@ def split_case_expectations(text: str) -> list[dict]:
     chunks: list[list[str]] = []
     # 段头同行可能直接跟第 1 条（`预期结果 1. 打开课程表页面`）
     if tail.strip():
-        chunks.append([tail.strip()])
+        tail_text = _strip_version_marks(tail)
+        if tail_text:
+            chunks.append([tail_text])
     for ln in lines[idx + 1:]:
         s = ln.strip()
+        if not s:
+            continue
+        # 版本分支标记（`【16.0：` / `】`）不是预期内容 —— 见 _strip_version_marks
+        if _VERSION_CLOSE_ONLY_RE.fullmatch(s):
+            continue
+        s = _strip_version_marks(s)
         if not s:
             continue
         # 段落结束：遇到下一个段头（操作步骤 / 预置条件 / 分隔线）
@@ -760,14 +839,29 @@ def match_expect_id(expectations: list[dict], expect_text: str) -> dict | None:
     return None
 
 
+# `case_stems` 的缓存：package -> (目录 mtime_ns, stems)。
+# 它被 `resolve_case_stem` 每条会话调一次，而 webui 的用例库一次要过几百条
+# 会话 —— 不缓存就是几百次 `glob("*.md")`（实测 426 次调用、2.7 万次路径拼接，
+# 占掉整个列表渲染的大头）。目录 mtime 一变（增删用例 md）就重扫，不需要失效通知。
+_CASE_STEMS_CACHE: dict[str, tuple[int, tuple[str, ...]]] = {}
+
+
 def case_stems(package: str | None) -> list[str]:
     """`assets/cases/<包名>/` 下所有用例 md 的文件名（不含 `.md`）。"""
     if not package:
         return []
     d = CASES_DIR / package
-    if not d.is_dir():
+    try:
+        signature = d.stat().st_mtime_ns
+    except OSError:
+        _CASE_STEMS_CACHE.pop(package, None)
         return []
-    return sorted(p.stem for p in d.glob("*.md"))
+    cached = _CASE_STEMS_CACHE.get(package)
+    if cached is not None and cached[0] == signature:
+        return list(cached[1])
+    stems = sorted(p.stem for p in d.glob("*.md"))
+    _CASE_STEMS_CACHE[package] = (signature, tuple(stems))
+    return list(stems)
 
 
 def _stem_num(stem: str) -> str | None:
@@ -1380,6 +1474,12 @@ def capture(d: "u2.Device", png: Path, xml: Path, meta: Path,
         info.update(extra)
     info["call_id"] = CALL_ID
     info["timing"] = timing_snapshot()
+    # ★ N-38：meta.json 是证据目录里唯一长期留存的「这一步怎么来的」记录。
+    #   `execution_state`（executed / may_have_executed / unknown）原来只写进
+    #   `storage/calls/<sid>/<call_id>.json` 那个账本 —— 事后单看某个 step 的
+    #   证据目录，没法判断这一帧是「动作做完之后拍的」还是「不确定做没做」。
+    #   真库 6245 份 meta.json 里 0 份有这个字段。
+    info["execution_state"] = runtime.EXECUTION_STATE
     with stage("meta_save"):
         meta.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
     if event is not None:
@@ -1751,11 +1851,32 @@ def add_common_args(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
                         "不声明默认点同意")
     p.add_argument("--perm", default=None,
                    help="配合 --perm-action：权限类型标记（如 media_images/camera）")
-    p.add_argument("--expect", default=None, dest="expect",
+    p.add_argument("--expect", default=None, dest="expect", type=_expect_arg,
                    help="检查点（**仅 act 用**）：动作后校验落点。"
                         "形如 activity=EditTimetableActivity 或 rid=et_schedule_name，"
-                        "逗号=AND、竖线=任一。由工具判", )
+                        "逗号=AND、竖线=任一。由工具判。"
+                        "只认 activity/rid/text/desc 四种键，写别的键会在解析参数时直接报错")
     return p
+
+
+def _expect_arg(spec: str) -> str:
+    """`--expect` 的 argparse 校验器：**在校验 argv 时**就把写法错拦住。
+
+    为什么放在这里而不是等到判定那一刻：检查点解析发生在动作已经做完之后，
+    那时设备已经被点过了。写法写错就得重跑一次动作 —— 而这是纯粹的输入错误，
+    应该在碰设备之前失败。
+
+    顺带一条：`--expect` 写上但内容全会失效，曾经是**静默的**——
+    `parse_expect` 丢掉不认识的键，`evaluate` 收到空条件返回
+    `{checked: false, ok: true}`，于是「我写了检查点」和「我没写」在结果上
+    一模一样。宁可在这里报错。
+    """
+    import checkpoint
+    try:
+        checkpoint.parse_expect(spec)
+    except checkpoint.ExpectSpecError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+    return spec
 
 
 def add_common_args_all_subcommands(p: argparse.ArgumentParser) -> None:
@@ -1789,8 +1910,8 @@ def add_common_args_all_subcommands(p: argparse.ArgumentParser) -> None:
                            "choices": ["grant", "deny"],
                            "dest": "perm_action", "help": argparse.SUPPRESS}),
         ("--perm", {"default": argparse.SUPPRESS, "help": argparse.SUPPRESS}),
-        ("--expect", {"default": argparse.SUPPRESS, "dest": "expect",
-                      "help": argparse.SUPPRESS}),
+        ("--expect", {"type": _expect_arg, "default": argparse.SUPPRESS,
+                      "dest": "expect", "help": argparse.SUPPRESS}),
     ]
     subparsers = [a for a in p._actions if isinstance(a, argparse._SubParsersAction)]
     for sp in subparsers:
@@ -1840,11 +1961,20 @@ def fail(msg: str, *, rejected: bool = False) -> None:
 
 
 def guard_terminated(tool: str) -> None:
-    """硬性拦截：会话已因崩溃终止时，拒绝执行任何观测/动作。
+    """硬性拦截：会话已收尾或因崩溃终止时，拒绝执行任何观测/动作。
 
     ⚠️ 用户明确要求："发现 Crash/ANR 就直接停止这个 case 的执行，不要做多余的事"。
     只发 `terminate` 信号靠 AI 自觉是不够的——AI 可能仍去截图/点击，
     产生不可信数据和无谓动作。故在工具入口硬拦。
+
+    **两条判据缺一不可**：
+      1. 会话有终止标记（崩溃/ANR/工具自身异常）；
+      2. 会话 `status` 不是 running —— 已经 finish 成 PASS/FAIL/BLOCKED/ERROR，
+         或被人从 WebUI 改了状态。
+
+    第 2 条是后来补的：原来只查第 1 条，于是「已收尾」的会话只要没走崩溃那条路，
+    就还能继续往里写事件 —— 结论已经落库，事件却还在长，事后按事件回看
+    会和结论对不上，而且全程没有任何报错。
 
     放行方式：session.py resume --id <N> --note "<为什么还能继续>"
     （人工确认是偶发、或已恢复前置后才用）。未开会话时不拦。
@@ -1857,22 +1987,50 @@ def guard_terminated(tool: str) -> None:
             return
         if recording_issues(STORAGE_DIR, sid):
             fail(f"Session {sid} has incomplete recording. Resolve it and finish ERROR/BLOCKED; do not replay actions.", rejected=True)
-        reason = get_db().get_termination(sid)
+        dbase = get_db()
+        reason = dbase.get_termination(sid)
+        status = _session_status(dbase, sid)
     except (OSError, ValueError, sqlite3.Error) as error:
         fail(f"Cannot verify session guard: {error}")
-    if not reason:
-        return
-    emit(False, {
-        "terminated": True,
-        "rejected": True,
-        "session_id": sid,
-        "error": f"会话 #{sid} 已终止，拒绝执行 {tool}",
-        "reason": reason,
-        "hint": ("被测/关联包已崩溃/ANR —— 本 case 到此结束，不要做多余的事。"
-                 "请记 BLOCKED finding 并 finish --status BLOCKED 收尾，"
-                 "然后继续下一条用例。"),
-    })
-    sys.exit(3)  # 独立退出码，便于调用方区分"被拦截"与"执行失败"
+    if reason:
+        emit(False, {
+            "terminated": True,
+            "rejected": True,
+            "session_id": sid,
+            "error": f"会话 #{sid} 已终止，拒绝执行 {tool}",
+            "reason": reason,
+            "hint": ("被测/关联包已崩溃/ANR —— 本 case 到此结束，不要做多余的事。"
+                     "请记 BLOCKED finding 并 finish --status BLOCKED 收尾，"
+                     "然后继续下一条用例。"),
+        })
+        sys.exit(3)  # 独立退出码，便于调用方区分"被拦截"与"执行失败"
+    if status and status != "running":
+        emit(False, {
+            "terminated": True,
+            "rejected": True,
+            "session_id": sid,
+            "status": status,
+            "error": f"会话 #{sid} 已收尾（{status}），拒绝执行 {tool}",
+            "hint": ("这个会话已经有结论了，再往里写事件会让记录和结论对不上。"
+                     "要接着跑就开新会话；确认是本会话漏了一步、必须补录，"
+                     f"先用 session.py resume --id {sid} --note \"<理由>\" 解封。"),
+        })
+        sys.exit(3)
+
+
+def _session_status(dbase, sid: int) -> str | None:
+    """只取 status 一列。
+
+    不用 `get_session()`：它会把该会话的 events + findings 全查出来，
+    而 `guard_terminated` 是**每次工具调用**都要走的入口，
+    为了确认一个状态把上千条事件拖进内存不值当。
+    """
+    try:
+        row = dbase._conn().execute(
+            "SELECT status FROM sessions WHERE id=?", (sid,)).fetchone()
+    except (sqlite3.Error, AttributeError):
+        return None
+    return row["status"] if row else None
 
 
 def settle(sec: float = 0.6) -> None:

@@ -59,29 +59,44 @@ def check_bounds(start, stages, size):
 
 
 def run_swipe(device, start, stages, *, clock=time.monotonic, sleep=time.sleep):
-    """按顺序执行按下、移动或停留、松手；时长为目标值，不保证严格实时。"""
+    """按顺序执行按下、移动或停留、松手；时长为目标值，不保证严格实时。
+
+    ⚠️ 松手放进 finally：中途任何异常（u2 断连、坐标被拒、sleep 被打断）都必须
+       抬手。少了这一步，手指会**一直按在屏幕上** —— 后续所有 tap 都变成
+       屏内误触，且只有断开 USB 才能恢复。异常照常往外抛，不吞。
+    """
     touch = device.touch
     position = start
     touch.down(*position)
-    for stage in stages:
-        seconds = stage["dur"] / 1000
-        if stage["type"] == "hold":
-            sleep(seconds)
-            continue
-        origin, target = position, stage["to"]
-        segment_start = clock()
-        deadline = segment_start + seconds
-        while True:
-            now = clock()
-            if now < deadline:
-                sleep(min(0.020, deadline - now))
-            now = clock()
-            fraction = 1.0 if now >= deadline else (now - segment_start) / seconds
-            point = tuple(round(a + (b - a) * fraction)
-                          for a, b in zip(origin, target))
-            if point != position or fraction >= 1:
-                touch.move(*point)
-                position = point
-            if fraction >= 1:
-                break
-    touch.up(*position)
+    ok = False
+    try:
+        for stage in stages:
+            seconds = stage["dur"] / 1000
+            if stage["type"] == "hold":
+                sleep(seconds)
+                continue
+            origin, target = position, stage["to"]
+            segment_start = clock()
+            deadline = segment_start + seconds
+            while True:
+                now = clock()
+                if now < deadline:
+                    sleep(min(0.020, deadline - now))
+                now = clock()
+                fraction = 1.0 if now >= deadline else (now - segment_start) / seconds
+                point = tuple(round(a + (b - a) * fraction)
+                              for a, b in zip(origin, target))
+                if point != position or fraction >= 1:
+                    touch.move(*point)
+                    position = point
+                if fraction >= 1:
+                    break
+        ok = True
+    finally:
+        # 抬手本身也可能失败（设备已掉线）。此时连接已经废了，
+        # 不能让它盖掉真正的根因 —— 只在「原本一切正常、只有 up 失败」时才外抛。
+        try:
+            touch.up(*position)
+        except Exception:  # noqa: BLE001
+            if ok:
+                raise

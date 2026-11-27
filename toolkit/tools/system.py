@@ -52,9 +52,8 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 
 from common import (add_common_args, apply_stdin_args, capture, connect, emit,
-                    evidence_paths, fail, guard_terminated, labeled_nodes,
-                    log_auto, next_targets, npm_identity, rel, summarize_xml,
-                    screen_view, filtered_sig, texts_payload)
+                    evidence_paths, fail, filtered_sig, guard_terminated,
+                    log_auto, rel, screen_view, texts_payload)
 from runtime import execution, timed_call
 import checkpoint
 
@@ -180,23 +179,38 @@ def _shade_open(xml_text: str, activity: str | None) -> bool:
     或快捷设置容器（`quick_settings_container`），或前台 activity 是不是
     `NotificationShade`。
 
-    ⚠️ 两个容器必须都认：只认通知列表的话，`quick_settings` 展开后
-    `notification_stack_scroller` 根本不出现（实测 dump 里只有 qs_* 那一串），
-    会被误判成「没展开」。也不能用「有 text 就算展开」——普通页面也有一堆 text。
+    两个容器都要认，少认一个就会把某种形态误判成「没展开」。
+    也不能用「有 text 就算展开」——普通页面也有一堆 text。
+
+    ⚠️ `activity` 里出现 `NotificationShade` 是最后一道兜底：实测这台 ROM
+    （6245 份真实 dump + 全部历史事件）**一次都没出现过**，所以它是给别的
+    ROM 留的，别指望它兜底当前设备。
     """
     return (SCROLLER_ID in xml_text or QS_PANEL_ID in xml_text
             or "NotificationShade" in (activity or ""))
 
 
 def _shade_kind(xml_text: str) -> str | None:
-    """展开的是哪块面板：'quick_settings' / 'notifications' / None（没展开）。
+    """展开的是哪块面板：'quick_settings' / 'notifications' / 'both' / None。
 
-    `quick_settings` 优先：快捷设置展开时 dump 里**只有** qs_* 那一串，
-    不会同时出现通知列表容器，所以先判它不会误伤。
+    ★ 真缺陷修复（实测 6245 份真实 dump）：旧实现「先判 QS」并注释断言
+    「快捷设置展开时 dump 里只有 qs_*，不会同时出现通知列表容器」——
+    **这句是错的**。`quick_settings_container` 一共出现 16 次，
+    这 **16 次全都同时含 `notification_stack_scroller`**：横屏分栏形态下
+    通知列表和快捷开关是同一屏左右并排，两个容器必然都在。
+    于是旧实现在横屏上把每一次展开都判成 quick_settings，
+    `system notifications` 会被判成「打开的是快捷设置」（假失败）。
+
+    所以两个都在 → 'both'，由 `_applied` 按「我要的那块在不在」判，
+    不再靠猜哪块「优先」。
     """
-    if QS_PANEL_ID in xml_text:
+    has_qs = QS_PANEL_ID in xml_text
+    has_scroller = SCROLLER_ID in xml_text
+    if has_qs and has_scroller:
+        return "both"
+    if has_qs:
         return "quick_settings"
-    if SCROLLER_ID in xml_text:
+    if has_scroller:
         return "notifications"
     return None
 
@@ -218,14 +232,21 @@ def _applied(args_action: str, *, opened: bool, kind: str | None,
     """
     if args_action in ("notifications", "quick_settings"):
         want = "quick_settings" if args_action == "quick_settings" else "notifications"
-        if opened and kind == want:
+        # 'both' = 横屏分栏形态：通知列表和快捷开关同屏并排，两块都是开着的。
+        # 这时「我要的那块」一定在，算生效 —— 判 false 会让 AI 白白重试。
+        if opened and (kind == want or kind == "both"):
             return True, ""
         if opened and kind and kind != want:
             got = "快捷设置" if kind == "quick_settings" else "通知栏"
             need = "快捷设置" if want == "quick_settings" else "通知栏"
             return False, f"打开后展开的是{got}，不是你要的{need}。"
         if opened:
-            return True, "面板已展开（认出 NotificationShade 焦点，但容器名不认识）。"
+            # 走到这里只可能是「activity 里认出 NotificationShade、两个容器都不认识」。
+            # 实测这台 ROM 从不出现该 activity（6245 份 dump 里 0 次），
+            # 但别的 ROM 可能这样，且那样确实说明面板开着 —— 保留 True。
+            return True, ("面板已展开（由 activity 里的 NotificationShade 判定，"
+                          "容器名不认识）—— 看不到容器就是解析不出通知，"
+                          "要判通知内容请看截图。")
         return False, ""
 
     if args_action == "close_shade":
@@ -481,8 +502,8 @@ def main() -> None:
 
     # 面板状态 + 通知列表解析（这是本工具相对「act 下拉 + observe 看」的核心增益）
     # **只有 `notifications` 才解析通知**：
-    #   · `quick_settings` 展开时 dump 里本来就没有通知列表容器，去解析只会
-    #     得到一句「没找到容器」的噪音，干扰 AI 读结果；
+    #   · `quick_settings` 要的是开关，不是通知；就算横屏分栏时通知容器也在，
+    #     把它当「通知列表」塞回去只会让 AI 在两个列表之间混淆；
     #   · wake/unlock/rotate/close_shade 的 dump 里也不该有面板。
     opened = _shade_open(xml_text, activity)
     kind = _shade_kind(xml_text)
@@ -500,13 +521,28 @@ def main() -> None:
         rot_after=rot_after)
     if args.action in shade_actions:
         detail += "（已展开）" if opened else "（⚠️ 没展开）"
+        # 横屏分栏：两块面板同屏并排。写进 detail，事后看记录能一眼明白
+        # 为什么「展的是通知栏」而 dump 里却有快捷设置容器。
+        if kind == "both":
+            detail += "（横屏分栏：通知列表与快捷开关同屏）"
         if notifications:
             detail += f" · 通知 {len(notifications)} 条：" + " ｜ ".join(
                 n["title"][:24] for n in notifications[:3])
 
-    # 检查点：和 act 一致，由工具判「落在预期位置没有」，不阻断
-    _sig = npm_identity(xml_text,
-                        None if getattr(args, "no_filter", False) else None)
+    # 检查点：和 act 一致，由工具判「落在预期位置没有」，不阻断。
+    #
+    # ⚠️ 签名必须和下面 screen_view 用**同一个过滤口径**（真缺陷修复）：
+    #   这里曾经写成 `None if X else None` —— 三元两个分支都是 None，
+    #   等于永远按「不过滤」算签名。于是同一个 dump 算出了两个签名：
+    #   `info["sig"]`（不过滤）和 `screen_view(...)["sig"]`（按包过滤），
+    #   `--expect rid=xxx` 的检查点走前者 —— 面板另一侧的节点也能命中，
+    #   「落点对不对」被系统界面的同名控件蒙对。
+    #
+    #   口径本身复用下面那条判定：**面板展开时不能按前台包过滤**
+    #   （通知栏/快捷设置是 systemui 盖在 App 上画的，foreground_of()
+    #   读到的仍是被盖住的 App），所以 expanded 就不过滤。
+    fg_for_sig = None if (getattr(args, "no_filter", False) or opened) else info.get("package")
+    _sig = filtered_sig(xml_text, fg_for_sig)
     info = {**info, "sig": _sig}
     _ck = checkpoint.evaluate(checkpoint.parse_expect(getattr(args, "expect", None)),
                               activity=activity, sig=_sig)
@@ -537,7 +573,7 @@ def main() -> None:
     # 盖在 App 上画的，`foreground_of()` 读到的仍是被盖住的那个 App
     # （实测 `com.zui.calendar.AllInOneActivity`）。照它过滤会把面板里所有控件
     # 全滤掉（实测 nodes_count=0、next 空）。所以：面板开着就不过滤。
-    fg = None if (getattr(args, "no_filter", False) or opened) else info.get("package")
+    fg = fg_for_sig
     # 走 screen_view 是为了共用"过滤后整屏为空就回退不过滤"的兜底
     # （面板以外还有相机/图库/权限框这些主体不属前台包的场景）。
     _view = screen_view(xml_text,

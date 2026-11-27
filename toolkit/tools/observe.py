@@ -113,20 +113,28 @@ def main() -> None:
                         else info.get("package"))
     nodes = _view["nodes"]
     _texts = _view["texts"]
-    # 知识卡浮现：`start` 时若还不知道包名，由首个 observe 补上（只提示一次）
+    # 知识卡浮现：`start` 时若还不知道包名，由首个 observe 补上；
+    # 之后**每切到一个新的包**再提示一次（按卡键去重，见 common.knowledge_hint_key）。
+    #
+    # ★ N-05：旧写法是 `if not get_db().knowledge_shown(_sid)` —— 会话级一次性，
+    #   首个 observe 提示过就永久静默。实测真库 418/427 会话如此，
+    #   于是「日历卡提示过 → 走到系统设置页（有 settings 卡）→ 不再提示」。
     k_hint = None
     try:
-        from common import knowledge_hint
+        from common import knowledge_hint, knowledge_hint_key
         from db import current_session, get_db
         _sid = current_session()
-        if _sid and not get_db().knowledge_shown(_sid):
-            k_hint = knowledge_hint(info.get("package"),
-                                    screen=info.get("activity"))
-            # ⚠️ 条件必须是"发出了 hint"而非"有专属卡"：无卡包返回的也是非 None
-            # （card=None + system_card 提示），若按 card 判就永远不落标记，
-            # 导致**每次 observe 都重复带一遍 system 提示**（实测确认）。
-            if k_hint:
-                get_db().mark_knowledge_shown(_sid)
+        if _sid:
+            _db = get_db()
+            _key = knowledge_hint_key(info.get("package"), info.get("activity"))
+            if _key and _key not in _db.knowledge_hint_keys(_sid):
+                k_hint = knowledge_hint(info.get("package"),
+                                        screen=info.get("activity"))
+                # ⚠️ 条件必须是"发出了 hint"而非"有专属卡"：无卡包返回的也是非 None
+                # （card=None + system_card 提示），若按 card 判就永远不落标记，
+                # 导致**每次 observe 都重复带一遍 system 提示**（实测确认）。
+                if k_hint:
+                    _db.mark_knowledge_hint(_sid, _key)
     except Exception:  # noqa: BLE001
         k_hint = None
     payload = {

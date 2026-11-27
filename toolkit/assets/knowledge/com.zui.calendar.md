@@ -109,9 +109,16 @@
 ## 通知栏展开会挡住后续操作
 
 上一条用例结束在**通知栏展开**状态时，下一条的第一步会打在通知栏上而**完全无效**：
-界面归属仍是通知栏（`NotificationShade`），页面上什么都没变。
+界面归属仍是 systemui 的面板，页面上什么都没变。
 
-- 判据：当前焦点是 `NotificationShade` 而不是应用自己的页面
+- 判据（**看视图树里的容器 id，不要看 activity 名**）：dump 里有
+  `com.android.systemui:id/notification_stack_scroller`（通知列表）或
+  `com.android.systemui:id/quick_settings_container`（快捷设置开关）就是展开着；
+  前台包同时会变成 `com.android.systemui`。
+- ⚠️ **不要用 `NotificationShade` 当判据**：这台 ROM 的 activity 名里从来不出现它
+  （实测 6245 份真实 dump、全部历史事件里 0 次），拿它判只会永远判成"没展开"。
+- ⚠️ **横屏时两个容器会同时出现**（通知列表在左、快捷开关在右，同一屏并排），
+  这时"有 `quick_settings_container`"不等于"展的是快捷设置"。
 - 收起方式见 `_system.md`；注意**不要用"再拉一次通知栏"去收起**，连拉两次仍然是展开的
 
 ## 判据口径与已知缺陷

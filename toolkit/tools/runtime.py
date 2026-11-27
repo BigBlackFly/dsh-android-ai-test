@@ -532,8 +532,24 @@ def pin_record(d: Path) -> None:
     os.environ["ANDROID_TEST_RECORD"] = str(d)
 
 
-def unpin_record() -> None:
-    """会话结束后清掉指针（不然下一次会误接到旧目录）。
+def _same_dir(a: Path | str, b: Path | str) -> bool:
+    """两个路径是否指向同一个目录。
+
+    用 `os.path.normcase` + `resolve(strict=False)` 做字符串比较，**不走 stat**：
+    指针只存路径字符串，同名目录被删了重建也该算同一个（否则 unpin 会漏删）。
+    `normcase` 是 Windows 必需 —— `D:\\X` 与 `d:\\x` 是同一目录，直接比字符串会不等。
+    """
+    def norm(p: Path | str) -> str:
+        try:
+            return os.path.normcase(os.path.abspath(Path(p)))
+        except (OSError, ValueError):
+            return os.path.normcase(str(p))
+
+    return norm(a) == norm(b)
+
+
+def unpin_record(owner: Path | str | None = None) -> bool:
+    """会话结束后清掉指针（不然下一次会误接到旧目录）。返回是否真的清了。
 
     ★ **同时留下 `.last` 存档。**
 
@@ -543,19 +559,42 @@ def unpin_record() -> None:
 
       `.last` 只是"上一段运行在哪"，不参与任何默认路径计算
       （否则又会污染下一次运行），只有显式点名要它时才读。
+
+    ⚠️ **必须带 `owner`，这是数据完整性要求**（真事故 2026-11-25）：
+      不校验归属的 unlink 会让 B 会话把 A 会话的指针删掉 —— 而 A 还活着。
+      后果不是报错，是**静默串台**：A 的下一次 observe 走 `_pinned_record()`
+      拿到 None，证据落到 `storage/evidence/_orphan/`，而 `current_session()`
+      仍指向 A（活会话）。真库已积压 `_orphan/` 10 个目录、
+      `orphan_evidence.log` 31 行。
+
+      `owner` 是本会话**自己的**运行目录。不匹配就什么都不做（返回 False）：
+      指针已被别人接管，删掉等于替别人收尾。
+      `owner=None` 是兼容旧调用方的**无校验**模式，新代码不要用。
     """
+    removed = False
     try:
-        # 先存档，再删指针 —— 顺序反了就丢信息
+        txt = ""
         try:
-            txt = _CURRENT_POINTER.read_text(encoding="utf-8").strip()
+            txt = _CURRENT_POINTER.read_text(encoding="utf-8-sig").strip()
+        except (OSError, UnicodeDecodeError):
+            txt = ""
+        # 归属校验：指针不是我的，就不碰（也**不写 .last** —— 那段运行还没收尾）
+        if owner is not None and txt and not _same_dir(txt, owner):
+            os.environ.pop("ANDROID_TEST_RECORD", None)
+            return False
+        try:
+            # 先存档，再删指针 —— 顺序反了就丢信息
             if txt:
                 _LAST_POINTER.write_text(txt, encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
+        except OSError:
             pass
-        _CURRENT_POINTER.unlink(missing_ok=True)
+        if _CURRENT_POINTER.exists():
+            _CURRENT_POINTER.unlink(missing_ok=True)
+            removed = True
     except OSError:
         pass
     os.environ.pop("ANDROID_TEST_RECORD", None)
+    return removed
 
 
 def last_record_dir() -> Path | None:
@@ -573,9 +612,13 @@ def last_record_dir() -> Path | None:
     if not txt:
         return None
     p = Path(txt).resolve()
-    if (p / "db.sqlite3").is_file():
-        return p
-    return None
+    # ★ 2026-11-26：判据原来是 `(p / "db.sqlite3").is_file()`。库在单库化
+    #   之后搬到了 `storage/test.db`，每个运行目录里根本没有 db.sqlite3 了
+    #   —— 于是这个函数**恒返回 None**，等于功能静默失效（实测 298 个运行
+    #   目录，没有一个含 db.sqlite3）。改成和 `_pinned_record()` 同一口径：
+    #   目录还在就算数。`.last` 是 `unpin_record()` 在删 `.current` **之前**
+    #   写的，所以它本来就该指向「上一次已收尾的那个运行目录」。
+    return p if p.is_dir() else None
 
 
 def _pinned_record() -> Path | None:

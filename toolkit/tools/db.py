@@ -40,39 +40,168 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import threading
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from runtime import CALL_ID, STORAGE_DIR, current_record_dir, recording_issues
 
 ROOT = Path(__file__).resolve().parent.parent
 
+# ── run 目录是否还在（N-11）────────────────────────────────────────
+# `sessions.run_id` 有两代格式：新的是 uuid（`new_record_dir()` 生成，目录一定在），
+# 旧的是 12 位 hex（多库时代每个会话一个 `run_history/<hex12>/db.sqlite3`）。
+# 单库化后旧值指向的目录**全都不存在**，而所有拼 `STORAGE_DIR/"run_history"/run_id`
+# 的代码都还照着拼 —— 结果静默空转（回放空白、录屏收尾白等 timeout）。
+#
+# 所以「拼路径」之前统一先问这里：目录在不在。不在就别拼，直接标 stale。
+def run_dir_path(run_id: str | None) -> Path | None:
+    """`storage/run_history/<run_id>` 的路径；run_id 为空或不合法时返回 None。
+
+    只做形状校验，**不判断存在性**（拼路径本身无害）。
+    """
+    if not run_id:
+        return None
+    name = str(run_id)
+    if not re.fullmatch(r"[\w-]{1,80}", name):
+        return None
+    return STORAGE_DIR / "run_history" / name
+
+
+def run_dir_missing(run_id: str | None) -> bool:
+    """该 run_id 指向的运行目录是否**已不存在**。
+
+    空 run_id / 形状不合法 → 也算 missing：调用方据此不要再拼路径。
+    """
+    path = run_dir_path(run_id)
+    return path is None or not path.is_dir()
+
 # 「预期1 …」「预期3：…」「步骤2 …」这类前缀，分组前要剥掉。与 common.py 里
 # 同名正则同口径 —— 不 import common 是为了避免循环依赖（common 在函数内 import db）。
 # 注意这里**只用于剥离**（把同一句文本的多种写法归一），不用于认编号；
 # 认编号只在 common.match_expect_id 里做，且那里**不认「步骤」**（步骤编号 ≠ 预期编号）。
+# ★ 2026-11-27（人裁决：预期才是判定基准）：PASS 判定的"时效自相矛盾"检测。
+#
+#   事故：另一台设备的 session 489 判 176 预期3（"进入空课程表后第一个小节显示加号"）
+#   PASS，但它挂的证据是**点过格子之后**拍的帧 —— 实际"进入时没有、点一下才出现"，
+#   与预期不符。本机同款：#619（session 152）、#1169（session 1000066）。
+#
+#   判据刻意做得**极窄**，只抓 actual 里自己写着"同一对象先无后有"的：
+#       无 <东西> …（点击/长按/操作）后 … 出现/才出现 <同一个东西>
+#   在真库 1548 条 PASS 上命中 2 条，**两条都是真问题，零误报**。
+#   宽一点的判据（只按 expect 含"进入后"、或证据帧之前有 act）会命中 78~99 条，
+#   绝大多数是正常的"默认值 + 再操作"描述 —— 那种不能用来报警。
+_SUSPECT_THING = (r"(?:rid=)?[a-z][a-z0-9_]{4,}|加号|加号浮标|开关|按钮|入口|"
+                   r"弹框|提示语|文案|图标")
+_SUSPECT_NEG_RE = re.compile(
+    r"(?:无|没有|不存在|未出现|不含|看不到)\s*(?:任何)?\s*(?P<t>" + _SUSPECT_THING + r")")
+_SUSPECT_POS_RE = re.compile(
+    r"(?:点击|点|长按|操作|滑动)[^。；\n]{0,25}?(?:后|之后)[^。；\n]{0,25}?"
+    r"(?:出现|新出现|才出现|显示|浮出|变亮|变为)")
+
 _EXPECT_PREFIX_RE = re.compile(
     r"^\s*(?:(?:预期|期望|断言|检查点)\s*\d{1,3}|(?:步骤|第)\s*\d{1,3})\s*(?:条)?\s*[:：.、,，]?\s*")
+
+
+def _case_stems(package: str | None) -> list[str]:
+    """某包下所有用例 md 的文件名（不含扩展名），按长度降序。
+
+    用文件名当分组键的锚点：`assets/cases/<pkg>/` 里的文件名就是用例的唯一身份，
+    比 `sessions.title` 稳定得多。按长度降序是为了让「重要的」先匹配，
+    避免 `日历_11` 这种短串抢在 `com.zui.calendar_设置事件显示_11` 前面。
+    """
+    if not package:
+        return []
+    d = ROOT / "assets" / "cases" / package
+    try:
+        return sorted((p.stem for p in d.glob("*.md")), key=len, reverse=True)
+    except OSError:
+        return []
+
+
+def _loose_case(s: str) -> str:
+    """抹掉编号、标点、空白、全角括号里的备注，只留中文与字母用于模糊比对。"""
+    s = re.sub(r"[（(][^)）]*[)）]", "", s or "")
+    s = re.sub(r"[_\-]?\d{2,4}(?!\d)", "", s)
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", s.lower())
+
+
+def _loose_parts(s: str | None) -> frozenset[str]:
+    """把标题拆成可比较的片段，**编号单独成片**。
+
+    `sessions.title` 的写法极不统一（`com.zui.calendar_176` 只有一个编号，
+    `日历_176 新建课程表检查` 却是「模块 + 编号 + 描述」），整串比对命中率很低。
+    拆成片段后，要求「标题片段」与「文件名片段」**完全相等**——
+    不做包含、不做后缀，因为 `重要日倒数07` 做后缀匹配会撞上
+    `…_重要日倒数_03`（03/04/05/07/08 同属「重要日倒数」系列，编号才是区分它们的唯一东西）。
+    """
+    parts: set[str] = set()
+    for seg in re.split(r"[\s/·、,，:：]+", (s or "").strip()):
+        seg = re.sub(r"[（(][^)）]*[)）]", "", seg)
+        for tok in re.split(r"[_\-]+", seg):
+            tok = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", tok.lower())
+            if tok:
+                parts.add(tok)
+    return frozenset(parts)
 
 
 def _case_key(title: str | None, package: str | None = None) -> str:
     """把同一用例的不同 title 写法归一到同一个键。
 
-    实测同一份用例在 `sessions.title` 里有 4 种写法（2026-11-18）：
+    同一份用例在 `sessions.title` 里有多种写法：
       `com.zui.calendar_新建课程表_176` / `com.zui.calendar_176`
       / `日历_176 新建课程表检查` / `新建课程表_176`
-    直接拿 title 当分组键会把同一用例拆成 4 组，跨轮抖动永远凑不齐。
+    直接拿 title 当分组键会把同一用例拆成多组，跨轮抖动永远凑不齐。
 
-    归一规则：取**用例编号**（`_\\d{2,4}` 末尾）；取不到就退回去掉包名前缀的
-    title 原文。重号（03 有两条）靠"同一句 expect 文本 + 同一 expect_id"再兜一层。
+    **不能只按编号归并**：用例编号并不唯一（同一包内 `_03` 有两条、
+    `_04`/`_05`/`_08` 都各有两条），而「重要日倒数」系列有 03/04/05/06/07/08/10
+    七八条，编号是它们之间唯一的区别。只按编号归并会把不同用例并成一组，
+    结论一 PASS 一 FAIL 就被报成「抖动」—— 纯假警。
+
+    归一顺序（越靠前越可靠）：
+      1. title 里原样含某个用例文件名 → 直接用那个文件名
+      2. 去包名前缀后模糊相等（`新建课程表_176` → `_新建课程表_176`）
+      3. 片段相等：标题片段集合 == 文件名片段集合
+      4. 片段包含：文件名片段集合是标题片段集合的子集
+      5. 都不中 → 退回去掉包名前缀的 title 原文
+
+    第 2~4 步命中多个候选时，**只有长度最长的那一个唯一**才认领；并列退回 ⑤ ——
+    宁可把同一用例拆成两组（漏报抖动），也不把两个用例错并成一组（制造假警）。
     """
     t = (title or "").strip()
-    if package and t.startswith(package):
-        t = t[len(package):].lstrip("_- ").strip()
-    m = re.search(r"[_\-](\d{2,4})(?!\d)", t)
-    if m:
-        return f"{(package or '').strip()}#{m.group(1)}"
-    return f"{(package or '').strip()}#{t}"
+    pk = (package or "").strip()
+    stems = _case_stems(pk)
+    if t and stems:
+        for st in stems:
+            if st in t:
+                return st
+    core = t[len(pk):].lstrip("_- ").strip() if pk and t.startswith(pk) else t
+    loose = _loose_case(core)
+    short = [st.replace(f"{pk}_", "") for st in stems] if pk else list(stems)
+
+    def _pick(hits: list[str]) -> str | None:
+        if not hits:
+            return None
+        best = max(hits, key=len)
+        # 「唯一」按**内容集**算，不按条数：同一候选在拼接列表里可能出现两次
+        # （包名前缀剥离与否的两种写法），那仍是同一个用例，不算歧义。
+        return best if len(set(hits)) == 1 else None
+
+    if loose and stems:
+        cand = _pick([st for st, s in zip(stems, short) if _loose_case(s) == loose])
+        if cand:
+            return cand
+    title_parts = _loose_parts(core)
+    if title_parts and stems:
+        stem_parts = {st: _loose_parts(s) for st, s in zip(stems, short)}
+        cand = _pick([st for st, p in stem_parts.items() if p and p == title_parts])
+        if cand:
+            return cand
+        cand = _pick([st for st, p in stem_parts.items() if p and p < title_parts])
+        if cand:
+            return cand
+    return f"{pk}#{core}"
 
 # 全局唯一数据库
 DB_FILE = STORAGE_DIR / "test.db"
@@ -129,7 +258,9 @@ CREATE TABLE IF NOT EXISTS sessions(
   perm_intent_action TEXT,
   perm_intent_perm TEXT,
   perm_intent_at TEXT,
+  perm_denied_keys TEXT,
   knowledge_shown INTEGER DEFAULT 0,
+  knowledge_hint_keys TEXT,
   summary TEXT,
   report_path TEXT,
   started_at TEXT,
@@ -212,7 +343,11 @@ class SessionDB:
                          "ALTER TABLE sessions ADD COLUMN perm_intent_action TEXT",
                          "ALTER TABLE sessions ADD COLUMN perm_intent_perm TEXT",
                          "ALTER TABLE sessions ADD COLUMN perm_intent_at TEXT",
+                         # ★ 2026-11-27：媒体类权限「先拒后允」两阶段，记这条会话已经拒过哪几类（camera/photo/video）
+                         "ALTER TABLE sessions ADD COLUMN perm_denied_keys TEXT",
                          "ALTER TABLE sessions ADD COLUMN knowledge_shown INTEGER DEFAULT 0",
+                         # ★ N-05：知识卡提示去重从"会话级一次性"改成"按卡键"
+                         "ALTER TABLE sessions ADD COLUMN knowledge_hint_keys TEXT",
                          "ALTER TABLE events ADD COLUMN call_id TEXT",
                          # 结构化预期编号：#4 起 findings 能对齐"第几条预期"，
                          # 不再靠凑中文。expect_id 是按位置排的 1..N（机器比对用），
@@ -227,6 +362,7 @@ class SessionDB:
                     pass
             conn.commit()
             conn.execute("CREATE INDEX IF NOT EXISTS idx_events_call ON events(call_id)")
+            self._ensure_seq_unique(conn)
             # run_id 是单库的主查询维度（前端按 run 筛、按 run 删）
             conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_run ON sessions(run_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at)")
@@ -264,20 +400,81 @@ class SessionDB:
                   data: dict | None = None, evidence: str | None = None,
                   duration_ms: int | None = None,
                   started_at: str | None = None) -> int | None:
+        """记一条事件。`seq` 在会话内必须严格递增且唯一。
+
+        ⚠️ **seq 是"先读后写"，必须在一个写事务里做完**（真事故 2026-11-25）：
+          旧写法 `SELECT MAX(seq)+1` 与 `INSERT` 之间没有互斥，
+          两个进程同时进 —— Python 的 sqlite3 是 legacy 事务模式，
+          `with conn:` 只在**第一个写语句**前才开事务，SELECT 属于读，
+          于是两边都读到同一个 MAX，**都插入成功**。
+          实测两进程各写 60 条：120 条写成功，只有 119 个唯一 seq
+          （seq=42 重复），时间轴据此排序会错位，`created_at` 还会倒退。
+          真库痕迹：session 53 的 seq=229 有两行，相隔 4ms。
+
+          修法两层：
+            ① `BEGIN IMMEDIATE` 在**读之前**就拿写锁，别的进程排队等
+               （timeout=10 秒，正常写一毫秒内就让出）；
+            ② `UNIQUE(session_id, seq)` 兜底 —— 就算哪天锁又被绕过，
+               数据库直接拒绝，而不是静默写进去两行。见 `_conn()` 里的迁移。
+        """
         conn = self._conn()
-        with conn:
+        # isolation_level=None：**关掉 sqlite3 的隐式事务**，让我们自己发
+        # BEGIN IMMEDIATE。否则 driver 会在第一条非 DML 语句前自作主张地
+        # 开一个 DEFERRED 事务，等读到 INSERT 才升级写锁 —— 竞态窗口还在。
+        with self._immediate(conn):
             if not conn.execute("SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone():
                 raise ValueError(f"Session {session_id} does not exist")
-            seq = self._conn().execute(
+            seq = conn.execute(
                 "SELECT COALESCE(MAX(seq),0)+1 FROM events WHERE session_id=?",
                 (session_id,)).fetchone()[0]
-            cur = self._conn().execute(
+            cur = conn.execute(
                 "INSERT INTO events (session_id, seq, kind, tool, detail, data_json,"
                 " evidence, duration_ms, started_at, created_at, call_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (session_id, seq, kind, tool, detail,
                  json.dumps(data, ensure_ascii=False) if data else None,
                  evidence, duration_ms, started_at, self._now(), CALL_ID))
             return cur.lastrowid
+
+    @staticmethod
+    def _ensure_seq_unique(conn: sqlite3.Connection) -> None:
+        """尽力给 events 加 `UNIQUE(session_id, seq)`，作为 seq 去重的兜底。
+
+        ⚠️ 为什么要「尽力」而不是直接建：真库已有历史重复
+           （session 53 的 seq=229 有两行）。直接建唯一索引会抛
+           `UNIQUE constraint failed`，于是**每次开库都失败** —— 比重复 seq 更糟。
+           所以：能建就建；建不上就只提示一次，正确性仍由
+           `log_event` 里的 `BEGIN IMMEDIATE` 保证（那是主防线）。
+           历史行**原样保留**：它们是既成事实，删任何一条都是篡改记录。
+        """
+        try:
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_events_session_seq "
+                "ON events(session_id, seq)")
+            conn.commit()
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            if getattr(SessionDB, "_seq_notice_done", False):
+                return
+            SessionDB._seq_notice_done = True
+            print("[db] 注意：events 表存在历史重复 (session_id, seq)，"
+                  "唯一索引未建立；新写入由 BEGIN IMMEDIATE 保证不重复。"
+                  "历史行原样保留（不作篡改）。", file=sys.stderr)
+
+    @staticmethod
+    @contextmanager
+    def _immediate(conn: sqlite3.Connection):
+        """`BEGIN IMMEDIATE ... COMMIT`，异常回滚。
+
+        不用 `with conn:`：那个只在第一条写语句前开 DEFERRED 事务，
+        对「先 SELECT 再 INSERT」的读改写模式保护不住（见 log_event 说明）。
+        """
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            conn.rollback()
+            raise
+        conn.commit()
 
     def add_finding(self, session_id: int, status: str, expect: str = "",
                     actual: str = "", note: str = "", event_id: int | None = None,
@@ -311,6 +508,29 @@ class SessionDB:
                 raise ValueError("Findings require an existing unfinished session")
             for eid in ids:
                 self._validate_evidence(conn, session_id, eid)
+            # ★ N-13：一张截图（一个 event）挂多条 finding 时**必须能看出来**。
+            #   真实库里最极端的一个 event 挂了 9 条 finding（124 组这样的组合）。
+            #   这本身合法 —— 同一次 actions 可以同时验证多条预期；但事后复盘时
+            #   「9 条结论都只凭这一张图」必须一眼可见，不能埋在关系表里。
+            #   所以：同一 event 已有结论时，把这件事追加进 note（不改人写的原文）。
+            shared = sorted({
+                int(r[0]) for r in conn.execute(
+                    "SELECT f.id FROM finding_events fe"
+                    " JOIN findings f ON f.id = fe.finding_id"
+                    " WHERE fe.event_id IN (%s) ORDER BY f.id" %
+                    ",".join("?" for _ in ids), ids).fetchall()
+            }) if ids else []
+            if shared:
+                marker = (f"【同一证据复用】该 finding 与 #{', #'.join(map(str, shared))} "
+                          f"共用同一批证据事件（event {', '.join(map(str, ids))}）——"
+                          f"多条预期由同一次操作观察得出")
+                note = f"{note}；{marker}" if note.strip() else marker
+            # ★ 2026-11-27：PASS 的时效自相矛盾（见 suspect_timeliness 说明）。
+            #   只标 note，不改 status —— 文本启发式判错了会把真 PASS 冤枉成可疑。
+            if status == "PASS":
+                _suspect = self.suspect_timeliness(expect, actual)
+                if _suspect:
+                    note = f"{note}；{_suspect}" if note.strip() else _suspect
             cur = self._conn().execute(
                 "INSERT INTO findings (session_id, event_id, status, expect, expect_id,"
                 " expect_label, actual, note, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
@@ -319,6 +539,30 @@ class SessionDB:
             fid = cur.lastrowid
             conn.executemany("INSERT INTO finding_events VALUES (?,?)", [(fid, eid) for eid in ids])
             return fid
+
+    @staticmethod
+    def suspect_timeliness(expect: str, actual: str) -> str:
+        """判断一条 PASS 是不是「时效自相矛盾」：actual 自己写着"进入时没有、操作后才有"。
+
+        返回空串 = 没发现问题；否则返回一句给人看的说明（写进 finding 的 note）。
+
+        为什么只在 note 里标、不改 status：这判据是文本启发式，宁可漏不可错 ——
+        判错了会把真 PASS 标成可疑，比漏报一条更糟。所以它只做「提醒复核」，
+        人的结论不动。
+        """
+        text = actual or ""
+        tokens = {m.group("t") for m in _SUSPECT_NEG_RE.finditer(text)}
+        if not tokens:
+            return ""
+        if not _SUSPECT_POS_RE.search(text):
+            return ""
+        repeated = [tok for tok in tokens
+                    if len(re.findall(re.escape(tok), text)) >= 2]
+        if not repeated:
+            return ""
+        return ("【时效待复核】actual 自述「" + "、".join(sorted(repeated)) +
+                "」进入时不存在、操作后才出现；若预期写的是「进入即应显示」，"
+                "本条应为 FAIL —— 判定基准是预期，不是步骤写法")
 
     @staticmethod
     def _validate_evidence(conn: sqlite3.Connection, session_id: int, event_id: int) -> None:
@@ -485,7 +729,19 @@ class SessionDB:
     # 设计参考 AiAgentTest 的 set_permission_intent：AI 在分支开头声明
     # "接下来遇到权限弹窗该点同意还是拒绝"，之后每次 act/observe 自动按此响应。
     # 关键：决策**提前做完**，动作时只执行——弹窗约 6s 自动消失，来不及现场想。
-    PERM_INTENT_TTL_S = 600.0   # 10 分钟过期（与 AiAgentTest 一致）
+    #
+    # ⚠️ TTL 曾经是 600 秒且**过期即静默降级成 grant**（真事故 2026-11-25）：
+    #    AI 声明 `--action deny` 准备验"拒绝路径"，10 分钟后再遇到弹窗，
+    #    get_perm_intent() 返回 None → perm.DEFAULT_ACTION="grant" →
+    #    **弹窗被点成「允许」**。用例测的拒绝路径根本没走到，但日志里只有一行
+    #    「（默认）」，看不出声明过 deny。这不是过期问题，是**语义反转**。
+    #
+    #    现在：TTL 只用来判「该不该再信」，**过期不进 grant**，而是
+    #    返回 `expired=True` 让调用方在日志里显式记一行，并把处置权
+    #    （点不点）交给人 —— 见 `perm.handle(action=None)` 的缺省分支。
+    #    TTL 也放宽到 30 分钟：一条 GUI 用例从声明到真正遇到弹窗，
+    #    10 分钟经常不够（实测 176 那轮光造数据就 12 分钟）。
+    PERM_INTENT_TTL_S = 1800.0  # 30 分钟
 
     def set_perm_intent(self, session_id: int, action: str,
                         permission: str = "") -> bool:
@@ -513,7 +769,21 @@ class SessionDB:
             return False
 
     def get_perm_intent(self, session_id: int) -> dict | None:
-        """返回 {"action","permission"}；无意图或已过期返回 None。"""
+        """返回声明过的权限意图；无声明返回 None。
+
+        返回 dict 的字段：
+          action       "grant" / "deny"
+          permission   声明时带的标记（如 media_images），可空
+          expired      True = 声明已超过 TTL，**action 仍原样带出**
+          age_s        声明距今秒数
+          ttl_s        TTL
+
+        ⚠️ 过期**不返回 None**（旧行为，已修）：调用方拿 None 会走
+           `perm.DEFAULT_ACTION="grant"`，把声明的 deny **静默反转成同意**。
+           现在把 `expired=True` 一起交出去，由调用方决定是「按声明执行并记警示」
+           还是「不点、留给人工」——`act.py` 选的是前者（保证用例能往下走），
+           但会在动作日志里写一条明确的 ⚠️，不再有静默。
+        """
         try:
             row = self._conn().execute(
                 "SELECT perm_intent_action, perm_intent_perm, perm_intent_at"
@@ -524,13 +794,74 @@ class SessionDB:
             return None
         at = row["perm_intent_at"] or ""
         try:
-            set_at = datetime.fromisoformat(at)
-            if (datetime.now() - set_at).total_seconds() > self.PERM_INTENT_TTL_S:
-                return None      # 过期即视为未声明
+            age_s = (datetime.now() - datetime.fromisoformat(at)).total_seconds()
         except (ValueError, TypeError):
-            return None
+            # 时间戳坏了：声明本身还在，按「已过期但内容可信」处理，
+            # 不因为一个脏时间戳把人声明的 deny 丢掉
+            age_s = self.PERM_INTENT_TTL_S + 1
         return {"action": row["perm_intent_action"],
-                "permission": row["perm_intent_perm"] or ""}
+                "permission": row["perm_intent_perm"] or "",
+                "expired": age_s > self.PERM_INTENT_TTL_S,
+                "age_s": round(age_s, 1),
+                "ttl_s": self.PERM_INTENT_TTL_S}
+
+    # ── 媒体类权限「两阶段」：先拒后允（2026-11-27 人明确裁决）────────
+    # 原始需求原话：「第一次点拒绝。第二次点同意」「第一次如果是主动点击了
+    # 拒绝，第二次不应该再点拒绝，应该点允许。并且第一次点拒绝权限是不会
+    # 发生变化的。」
+    #
+    # 为什么不能靠 TTL / 一次性的「意图过期」去实现：那是副作用，不是规则。
+    # 旧版正是靠「AI 手动 perm-intent --clear」把 deny 弄掉，第二次弹框才
+    # 落回默认 grant；一旦没人清（现在 act --permAction 是内联写入），deny
+    # 会一直粘着，第二次框只剩「拒绝并不再询问」（被 perm.py 主动排除，因为
+    # 点了这个权限就再也不会弹框、同意分支就没了）→ 匹配不到按钮 →
+    # unmatched，框留在屏上，AI 只能反复重触发（实测会话 #1000232 连栽 4 次）。
+    #
+    # 所以把「已经拒过哪几类权限」显式记在会话上，由工具据此推进第二阶段。
+    def perm_denied_keys(self, session_id: int) -> set[str]:
+        """本会话已经把哪些权限类（camera/media/mic）「拒绝」过一次。"""
+        try:
+            row = self._conn().execute(
+                "SELECT perm_denied_keys FROM sessions WHERE id=?",
+                (session_id,)).fetchone()
+        except sqlite3.Error:
+            return set()
+        raw = row["perm_denied_keys"] if row else None
+        if not raw:
+            return set()
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            return set()
+        if not isinstance(data, list):
+            return set()
+        return {str(x) for x in data if str(x).strip()}
+
+    def mark_perm_denied(self, session_id: int, key: str) -> None:
+        """记一次「这类权限已经拒绝过了」，返回给下一阶段判断用。"""
+        key = (key or "").strip()
+        if not key:
+            return
+        keys = self.perm_denied_keys(session_id)
+        if key in keys:
+            return
+        keys.add(key)
+        try:
+            self._conn().execute(
+                "UPDATE sessions SET perm_denied_keys=? WHERE id=?",
+                (json.dumps(sorted(keys), ensure_ascii=False), session_id))
+            self._conn().commit()
+        except sqlite3.Error:
+            pass
+
+    def clear_perm_denied(self, session_id: int) -> None:
+        """清掉两阶段状态（换分支 / 重新测拒绝路径时用）。"""
+        try:
+            self._conn().execute(
+                "UPDATE sessions SET perm_denied_keys=NULL WHERE id=?", (session_id,))
+            self._conn().commit()
+        except sqlite3.Error:
+            pass
 
     def mark_knowledge_shown(self, session_id: int) -> None:
         """记录"知识卡提示已给过"——避免每步重复带索引浪费 token。"""
@@ -542,6 +873,7 @@ class SessionDB:
             pass
 
     def knowledge_shown(self, session_id: int) -> bool:
+        """兼容旧口径：本会话是否提示过**任何**知识卡。"""
         try:
             row = self._conn().execute(
                 "SELECT knowledge_shown FROM sessions WHERE id=?",
@@ -549,6 +881,52 @@ class SessionDB:
             return bool(row and row["knowledge_shown"])
         except (sqlite3.Error, TypeError, IndexError):
             return False
+
+    def knowledge_hint_keys(self, session_id: int) -> set[str]:
+        """本会话已经提示过的知识卡键集合（键的算法见 common.knowledge_hint_key）。
+
+        ★ N-05：原来是 `sessions.knowledge_shown` 一个**会话级布尔** —— 一张卡提过
+        之后，切到别家应用的界面（哪怕那家也有专属卡）再也不提示。实测真库
+        418/427 会话都是「提示过一次就永久静默」，而 `_system.md` 写的是
+        「按前台包读卡」，从没说过只提示一次。
+
+        现在换成键集合：每个包各提示一次，无卡包的系统卡提示整个会话只提一次。
+        """
+        try:
+            row = self._conn().execute(
+                "SELECT knowledge_hint_keys FROM sessions WHERE id=?",
+                (session_id,)).fetchone()
+        except (sqlite3.Error, TypeError, IndexError):
+            return set()
+        raw = row["knowledge_hint_keys"] if row else None
+        if not raw:
+            return set()
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            return set()
+        return {str(x) for x in data} if isinstance(data, list) else set()
+
+    def mark_knowledge_hint(self, session_id: int, key: str) -> None:
+        """记录某个知识卡键已经提示过。
+
+        同时把旧列 `knowledge_shown` 置 1：那是"有没有提示过任何卡"的粗粒度
+        标记，旧的读法（webui / 老会话）还在用，不能让它失真。
+        """
+        key = str(key or "").strip()
+        if not key:
+            return
+        keys = self.knowledge_hint_keys(session_id)
+        if key in keys:
+            return
+        keys.add(key)
+        try:
+            self._conn().execute(
+                "UPDATE sessions SET knowledge_hint_keys=?, knowledge_shown=1 WHERE id=?",
+                (json.dumps(sorted(keys), ensure_ascii=False), session_id))
+            self._conn().commit()
+        except sqlite3.Error:
+            pass
 
     def set_related(self, session_id: int, related: list[str]) -> None:
         try:
@@ -699,16 +1077,25 @@ class SessionDB:
             return 0
 
     def list_events(self, session_id: int) -> list[dict]:
-        """某会话的全部事件（按 seq 升序）。给导出台账/步骤序列用。"""
+        """某会话的全部事件（按 seq 升序）。给导出台账/步骤序列/复盘用。
+
+        N-24：以前只给 `seq/kind/tool/detail/data_json`，**拿不到事件主键、
+        证据路径和耗时** —— 于是任何"按事件回查证据"的调用方（导出台账、
+        复盘、定位某一步的截图）都得绕道再查一遍库，或者干脆查不出来。
+        现在把 id / evidence / duration_ms / started_at / created_at /
+        call_id 一起带出：这些列都很窄，多读一行的成本远低于二次查询。
+        """
         try:
             rows = self._conn().execute(
-                "SELECT seq, kind, tool, detail, data_json"
+                "SELECT id, seq, kind, tool, detail, data_json, evidence,"
+                " duration_ms, started_at, created_at, call_id"
                 " FROM events WHERE session_id=? ORDER BY seq",
                 (session_id,)).fetchall()
         except sqlite3.Error:
             return []
-        return [{"seq": r[0], "kind": r[1], "tool": r[2],
-                 "detail": r[3], "data_json": r[4]} for r in rows]
+        keys = ("id", "seq", "kind", "tool", "detail", "data_json", "evidence",
+                "duration_ms", "started_at", "created_at", "call_id")
+        return [dict(zip(keys, r)) for r in rows]
 
     def efficiency_stats(self, session_id: int) -> dict:
         """操作效率自查（finish 时提示，防止"跑得很脏"却无人察觉）。
@@ -720,6 +1107,17 @@ class SessionDB:
             重复手势应用 `act tap --repeat N`。
 
         这里只**如实统计并提示**，不阻断 finish（效率差不等于用例结论错）。
+
+        ## N-26：为什么必须解析 JSON，不能 grep 字符串
+
+        旧写法靠 `'"type": "swipe"' in data_json` 判滑动。这有两个坑：
+          ① 只能命中 `json.dumps` 的默认分隔符风格（`", "` / `": "`）；
+             经 `separators=(",", ":")` 或手写压缩过的 JSON 一律漏计
+             —— 实测真库 `json.loads` 数出 436 次 swipe，字符串匹配得 0；
+          ② 子串匹配会命中**任何**层级里的 `type`（比如某个嵌套 dict
+             也叫 `type`），把非滑动动作算成滑动，反之亦然。
+        现在统一 `json.loads` 后按字段取，并保留旧版漏掉的 `multi_stage_swipe`
+        （多段连续滑动同样是滑动，且更该被提示"能不能用 repeat 代替"）。
         """
         out = {"act": 0, "observe": 0, "swipe": 0, "cp_miss": 0, "ratio": None}
         try:
@@ -728,6 +1126,7 @@ class SessionDB:
                 (session_id,)).fetchall()
         except sqlite3.Error:
             return out
+        _SWIPE_KINDS = {"swipe", "multi_stage_swipe", "drag"}
         for kind, dj in rows:
             if kind == "observe":
                 out["observe"] += 1
@@ -735,9 +1134,18 @@ class SessionDB:
                 out["act"] += 1
                 if not dj:
                     continue
-                if '"type": "swipe"' in dj or '"type":"swipe"' in dj:
+                try:
+                    data = json.loads(dj)
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                act = data.get("action")
+                act_type = str(act.get("type") or "") if isinstance(act, dict) else ""
+                if act_type in _SWIPE_KINDS:
                     out["swipe"] += 1
-                if '"ok": false' in dj or '"ok":false' in dj:
+                ck = data.get("checkpoint")
+                if isinstance(ck, dict) and ck.get("ok") is False:
                     out["cp_miss"] += 1
         if out["act"]:
             out["ratio"] = round(out["observe"] / out["act"], 2)
@@ -793,37 +1201,62 @@ class SessionDB:
         # ③ 文件删除放后台 daemon 线程（秒级，不阻塞 HTTP 响应）
         db_path = self.path
         storage_root = Path(db_path).parent.resolve()
+        evidence_root = (ROOT / "evidence").resolve()
+
+        def _allowed(fp: Path) -> bool:
+            """证据路径白名单：`storage/` 之下，或项目根的 `evidence/` 之下。
+
+            evidence 是 common.rel() 出来的**项目根相对**路径；没有 run 目录时
+            落在 ROOT/evidence/...（`evidence_paths` 的无 record_dir 分支）。
+            只认 storage_root 会把这类整片跳过 —— 历史缺陷：它们永远删不掉，
+            而返回的 files/dirs 又是写死的 0，调用方看不出没删。
+            """
+            try:
+                return fp.is_relative_to(storage_root) or fp.is_relative_to(evidence_root)
+            except OSError:
+                return False
+
+        # 待删清单在**同步段**算好：只做目录枚举（毫秒级），unlink/rmtree 放后台。
+        # 这样 files/dirs 是真实数字，而不是写死的 0（旧实现让调用方以为删干净了）。
+        targets: list[Path] = []
+        step_dirs: set[Path] = set()
+        for rel_p in ev_paths:
+            try:
+                fp = (ROOT / rel_p).resolve()
+            except (OSError, ValueError):
+                continue
+            if not _allowed(fp):
+                continue
+            if fp.is_file():
+                targets.append(fp)
+            parent = fp.parent
+            if (parent != storage_root and parent != evidence_root
+                    and parent.is_dir() and _allowed(parent)):
+                step_dirs.add(parent)
+        auto_dirs: list[Path] = []
+        for base in ("evidence", "logs"):
+            d = Path(db_path).parent / base / str(session_id)
+            if d.is_dir():
+                auto_dirs.append(d)
+        candidate_dirs = sorted(step_dirs) + auto_dirs
+        counted: set[Path] = set(targets)
+        for d in candidate_dirs:
+            for f in d.rglob("*"):
+                if f.is_file():
+                    counted.add(f.resolve())
+        files_n = len(counted)
+        dirs_n = len(candidate_dirs)
 
         def _bg_cleanup() -> None:
-            files_n, dirs_n = 0, 0
             try:
-                step_dirs: set[Path] = set()
-                for rel_p in ev_paths:
+                for d in candidate_dirs:
+                    shutil.rmtree(d, ignore_errors=True)
+                for f in targets:
                     try:
-                        fp = (ROOT / rel_p).resolve()
-                        if not fp.is_relative_to(storage_root):
-                            continue
-                        if fp.is_file():
-                            fp.unlink()
-                            files_n += 1
-                        if fp.parent != storage_root and fp.parent.is_dir():
-                            step_dirs.add(fp.parent)
+                        if f.is_file():
+                            f.unlink()
                     except OSError:
                         pass
-                # 步骤目录整棵删（含同目录 dump.xml / meta.json / crash.log）
-                for d in step_dirs:
-                    n = sum(1 for _ in d.rglob("*") if _.is_file())
-                    if shutil.rmtree(d, ignore_errors=True) or not d.exists():
-                        files_n += n
-                        dirs_n += 1
-                # 自动命名目录 <会话id>/ 整棵删
-                for base in ("evidence", "logs"):
-                    d = Path(db_path).parent / base / str(session_id)
-                    if d.is_dir():
-                        n = sum(1 for _ in d.rglob("*") if _.is_file())
-                        if shutil.rmtree(d, ignore_errors=True) or not d.exists():
-                            files_n += n
-                            dirs_n += 1
                 # 清掉遗留的空目录（只清空的，不动有内容的）
                 ev_root = Path(db_path).parent / "evidence"
                 if ev_root.is_dir():
@@ -831,7 +1264,6 @@ class SessionDB:
                         if sub.is_dir() and not any(sub.iterdir()):
                             try:
                                 sub.rmdir()
-                                dirs_n += 1
                             except OSError:
                                 pass
             except Exception:  # noqa: BLE001
@@ -839,7 +1271,9 @@ class SessionDB:
 
         threading.Thread(target=_bg_cleanup, daemon=True,
                          name=f"evidence-cleanup-{session_id}").start()
-        return {"ok": True, "files": 0, "dirs": 0}  # 文件后台删，数字未知记 0
+        # files/dirs 是**本次待删的真实数量**（同步枚举出来的）；实际 unlink 在后台，
+        # 极端情况下可能残留几个孤儿文件 —— 数字表示"计划删这么多"，不是"已删掉这么多"。
+        return {"ok": True, "files": files_n, "dirs": dirs_n, "deferred": True}
 
     def set_session_kind(self, session_id: int, kind: str) -> bool:
         """切换会话类型（test=进测试记录 / diag=验证调试，默认不展示）。"""
@@ -913,13 +1347,15 @@ class SessionDB:
         rows = self._conn().execute(sql, params + (limit,)).fetchall()
         out = [dict(r) for r in rows]
         # 「回放」入口是否可用：该会话至少有一帧的截图还在磁盘上。
-        # ⚠️ 证据可能被 cleanup 轮转或误删 —— 那时按钮要置灰，而不是点进去才发现播不了。
+        # ⚠️ 证据可能被手工清理或误删 —— 那时按钮要置灰，而不是点进去才发现播不了。
         # 放在这里统一算（列表页要按行显示），避免前端为每条记录各发一次请求。
         for r in out:
             evs = self._conn().execute(
                 "SELECT evidence FROM events WHERE session_id=? AND evidence IS NOT NULL"
                 " AND evidence != '' LIMIT 50", (r["id"],)).fetchall()
             r["has_evidence"] = any((ROOT / e["evidence"]).is_file() for e in evs)
+            # 运行目录已不存在的旧会话：前端据此置灰「回放」，后端据此不拼证据路径。
+            r["stale_run_id"] = run_dir_missing(r.get("run_id"))
         return out
 
     def session_kind_counts(self) -> dict:
@@ -1002,6 +1438,28 @@ class SessionDB:
         out.sort(key=lambda x: -x["idle_min"])
         return out
 
+    def findings_of(self, session_id: int) -> list[dict]:
+        """某会话的全部 findings（按 id 升序），每条带 `event_ids`。
+
+        比 `get_session()` 轻：不拉事件流、不拼 evidence 引用。
+        给 checklist 对账（"哪些预期已经勾过"）和"两次勾选之间必须有新事件"
+        的判据用 —— 那两处都是热路径，不值得为两个字段把整会话装一遍。
+        """
+        conn = self._conn()
+        out: list[dict] = []
+        for row in conn.execute(
+                "SELECT * FROM findings WHERE session_id=? ORDER BY id",
+                (session_id,)).fetchall():
+            finding = dict(row)
+            ids = [r[0] for r in conn.execute(
+                "SELECT event_id FROM finding_events WHERE finding_id=?",
+                (finding["id"],))]
+            if finding["event_id"] is not None and finding["event_id"] not in ids:
+                ids.insert(0, finding["event_id"])
+            finding["event_ids"] = ids
+            out.append(finding)
+        return out
+
     def get_session(self, session_id: int) -> dict | None:
         row = self._conn().execute(
             "SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
@@ -1047,6 +1505,10 @@ class SessionDB:
         """某次运行（uuid）下的全部会话。
 
         正常只有一个；重复 start 会产生多个（2026-10-31 跑 46 就撞见过）。
+
+        ⚠️ 这里**不按目录存在性过滤**：会话记录本身是真的，目录没了仍然要能
+        按 run_id 查出来（否则历史记录会"消失"）。调用方要判回放可用性，
+        用 `run_dir_missing(run_id)`。
         """
         return [dict(r) for r in self._conn().execute(
             "SELECT * FROM sessions WHERE run_id=? ORDER BY id", (run_id,))]
@@ -1055,28 +1517,56 @@ class SessionDB:
         """运行列表（按 run_id 聚合），新的在前。
 
         单库化让这件事变成一句 GROUP BY —— 以前要开 138 个库才能算出来。
+
+        ## 代表状态怎么取（N-25 修正）
+
+        旧写法按 `PASS, FAIL, BLOCKED, ERROR` 从前到后找第一个命中 ——
+        于是「同一次运行里一条 PASS、一条 FAIL」会显示成 **PASS**，
+        把失败盖掉了；`running` 更是没进优先级，只有全部落空时才靠
+        `sts[0]` 兜底。
+        现在的口径是「这次运行到底跑完没有 + 最坏结论」：
+          ① 还有 `running` → 整次没跑完，显示 `running`
+          ② 否则按 `ERROR > BLOCKED > FAIL > PASS` 取最坏的那个
+        （同一运行多次会话里出现的最坏结论，才是这次运行该被记住的结论）。
+
+        ## 标题为什么不再 split(",")
+
+        `GROUP_CONCAT(DISTINCT title)` 用逗号连接，而**用例标题里本来就有逗号**
+        （如「日历_176 新建课程表，检查…」）→ `split(",")[0]` 会把标题截断成
+        前半句。SQLite 的 `group_concat(DISTINCT x, y)` 不支持自定义分隔符，
+        所以改成单独再查一遍每个 run 的首个 title（limit ≤ 200，成本可忽略）。
         """
         rows = self._conn().execute(
             "SELECT run_id,"
             " COUNT(*) AS session_count,"
             " MIN(started_at) AS started_at,"
             " MAX(COALESCE(finished_at, started_at)) AS ended_at,"
-            " GROUP_CONCAT(DISTINCT title) AS titles,"
             " GROUP_CONCAT(DISTINCT status) AS statuses"
             " FROM sessions WHERE run_id IS NOT NULL AND run_id != ''"
             " GROUP BY run_id ORDER BY MIN(started_at) DESC LIMIT ?",
             (limit,)).fetchall()
         out = [dict(r) for r in rows]
+        _ORDER = ("running", "ERROR", "BLOCKED", "FAIL", "PASS")
         for r in out:
-            # 库里有多个会话时取「有结论的那个」当代表状态
-            sts = (r.get("statuses") or "").split(",")
-            for pref in ("PASS", "FAIL", "BLOCKED", "ERROR"):
-                if pref in sts:
-                    r["status"] = pref
-                    break
-            else:
-                r["status"] = sts[0] if sts else "running"
-            r["title"] = (r.get("titles") or "").split(",")[0]
+            sts = [s for s in (r.pop("statuses") or "").split(",") if s]
+            r["statuses"] = sorted(set(sts))
+            r["status"] = "running" if "running" in sts else (
+                next((s for s in _ORDER if s in sts), "running"))
+            # 旧格式 run_id（hex12）指向的目录已不存在 —— 回放/录屏都不可能有。
+            r["stale_run_id"] = run_dir_missing(r.get("run_id"))
+        # 单独取每个 run 的首个 title（避开 GROUP_CONCAT 的逗号歧义）
+        if out:
+            ids = [r["run_id"] for r in out]
+            marks = ",".join("?" for _ in ids)
+            first: dict[str, str] = {}
+            for run_id, title in self._conn().execute(
+                    f"SELECT run_id, title FROM sessions"
+                    f" WHERE run_id IN ({marks})"
+                    f" AND title IS NOT NULL AND title != ''"
+                    f" ORDER BY id", ids).fetchall():
+                first.setdefault(run_id, title)
+            for r in out:
+                r["title"] = first.get(r["run_id"]) or ""
         return out
 
     def stats_by_run(self) -> dict:

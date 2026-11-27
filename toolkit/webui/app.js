@@ -994,7 +994,7 @@ async function viewSession(id) {
   };
   const scopeLabel = { target: "被测包", related: "关联包", other: "其他包" };
   const fmtGap = sec => sec >= 60 ? `${Math.floor(sec / 60)}m${Math.round(sec % 60)}s` : `${sec.toFixed(1)}s`;
-  // 有无可回放的截图（图可能被 cleanup 轮转掉）→ 决定回放按钮是否可点
+  // 有无可回放的截图（图可能被手工清理掉）→ 决定回放按钮是否可点
   const hasEv = (s.events || []).some(e => e.evidence);
 
   main.innerHTML = `

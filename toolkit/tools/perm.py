@@ -27,6 +27,47 @@ try:
 except Exception:  # noqa: BLE001  common 不可用时不要因此崩掉
     pass
 
+# ---------- 权限名归一（state.py / perm_tool.py 共用） ----------
+# ★ 2026-11-26 从 state.py 下沉到这里：原来只有 state.py 有短名表，
+#   perm_tool.py 的 _full_name 只补前缀不映射也不大写 —— 传 media_images
+#   得到 `android.permission.media_images`（真名 READ_MEDIA_IMAGES），
+#   pm grant 静默失败，而调用方以为"已经授好了"。
+PERMISSION_PREFIX = "android.permission."
+PERMS = {
+    "camera": "android.permission.CAMERA",
+    "location": "android.permission.ACCESS_FINE_LOCATION",
+    "coarse_location": "android.permission.ACCESS_COARSE_LOCATION",
+    "mic": "android.permission.RECORD_AUDIO",
+    "contacts": "android.permission.READ_CONTACTS",
+    "storage": "android.permission.READ_EXTERNAL_STORAGE",
+    "media_images": "android.permission.READ_MEDIA_IMAGES",
+    "notifications": "android.permission.POST_NOTIFICATIONS",
+}
+
+
+def resolve_perm(value: str) -> str:
+    """把用户写的权限名归一成 `android.permission.XXX`。
+
+    三条规则，顺序不能换：
+      ① 短名表命中（大小写不敏感）→ 用映射值
+         （`media_images` → READ_MEDIA_IMAGES，逐个大写猜不出来）
+      ② 已带 `android.permission.` 前缀 → 原样返回（后半段不动，
+         带 `android.permission.camera` 这种大小写错的就让它错，
+         报错信息比"悄悄改成 CAMERA"更有用）
+      ③ 其它 → 补前缀后 **大写**（`read_calendar` → READ_CALENDAR）
+    空串返回空串，由调用方判。
+    """
+    name = (value or "").strip()
+    if not name:
+        return ""
+    short = name.lower()
+    if short in PERMS:
+        return PERMS[short]
+    if name.lower().startswith(PERMISSION_PREFIX):
+        return name
+    return PERMISSION_PREFIX + name.upper()
+
+
 # 系统权限弹窗的 activity 标记（大小写不敏感）
 ACTIVITY_MARKERS = ("permissioncontroller", "grantpermissionsactivity")
 
@@ -127,6 +168,46 @@ def match_button(buttons: list[dict], action: str) -> dict | None:
             if b["text"] == t:
                 return b
     return None
+
+
+# 媒体类权限：图片 / 视频 / 拍照。这类权限在真机上「第一次拒绝不会改变授权
+# 状态，弹框下次还会再来」，所以能靠「先拒一次、再允一次」在一个会话里把两条
+# 分支都验掉（人 2026-11-27 明确裁决）。其它权限（通知/日历/联系人/设备信息）
+# 拒一次就真的拒了、再也不会弹，不能这么干 —— 所以必须按文案区分开。
+_MEDIA_HINTS = (
+    "摄像头", "相机", "拍照", "拍摄", "照片", "图片", "相册", "视频",
+    "camera", "photo", "video", "picture", "image",
+)
+
+
+def is_media_dialog(info: dict | None) -> bool:
+    """这个权限框是不是「图片 / 视频 / 拍照」这类媒体权限。
+
+    只看弹框的申请文案（`info['prompt']`）。拿不到文案就返回 False ——
+    宁可不做两阶段，也不能把「拒了就再也不弹」的权限误判成媒体类，
+    那会把用例的「同意」分支直接做废。
+    """
+    prompt = ((info or {}).get("prompt") or "").lower()
+    return bool(prompt) and any(h.lower() in prompt for h in _MEDIA_HINTS)
+
+
+def dialog_key(info: dict | None) -> str:
+    """给「这一类权限申请」算个身份键 —— 用来判断两次弹框是不是同一类权限。
+
+    用申请文案本身（「日历正在尝试打开摄像头」「日历正在尝试访问您设备上的
+    照片」）当键，不建关键词表：
+      · 同一权限重复申请时文案完全一致（实测 #1000232 的 4 份 dump 逐字相同），
+        正好可以用来认「这类权限刚才已经拒过一次了」；
+      · 换 App / 换语言都不需要改代码，也不用维护 camera/media/mic 的映射；
+      · 文案取不到时退化成按钮文案集合，仍然是「这个框长什么样」的稳定指纹。
+    """
+    if not info:
+        return ""
+    prompt = str(info.get("prompt") or "").strip()
+    if prompt:
+        return prompt
+    texts = sorted(str(b.get("text") or "") for b in (info.get("buttons") or []))
+    return "|".join(t for t in texts if t)
 
 
 def permission_prompt(xml_text: str) -> str:
@@ -240,13 +321,36 @@ def _frame_signature(info: dict | None) -> str:
 
 
 def handle(d, action: str | None = None, shot=None, on_dialog=None,
-           settle_s: float = 0.3, chain_max: int = 8) -> dict:
+           settle_s: float = 0.3, chain_max: int = 8,
+           denied_keys: set[str] | None = None,
+           on_denied=None) -> dict:
     """看见权限框就点，点到框没了为止 —— 和测试员的做法完全一致。
 
     多权限申请时 Android **不关框**，就在同一个框里点一次换下一个权限，
     所以循环判据只有一条：**框还在就继续点**。`chain_max` 只是防死循环的兜底。
 
     action=None → 用 DEFAULT_ACTION（grant，默认同意）。
+
+    ## 媒体类权限「两阶段」：第一次拒、第二次允（2026-11-27 人明确裁决）
+
+    人 2026-11-27 的原话：「默认是点允许。图片视频拍照这种 应该是跑case之前就应该
+    按照我们知识卡的内容。第一次点拒绝。第二次点同意。」「第一次如果是主动点击了
+    拒绝。第二次不应该在点拒绝。应该点允许。并且第一次点拒绝权限是不会发生变化的。」
+
+    只有**媒体类权限**（拍照 / 图片 / 视频，见 `is_media_dialog`）这么干：这类权限
+    第一次拒绝不改变授权状态，弹框下次还会再来，正好用第二次来测同意分支。别的权限
+    （通知/日历/联系人/设备信息）拒一次就真的拒了、再也不弹，不能自动拒。
+
+    denied_keys 是「本会话已经拒过哪些权限类」的集合（`dialog_key()` 产生的键）。
+    同一类权限的弹框第二次出现时**不再点拒绝，改点允许** —— 固定规则，不是等 TTL
+    过期的副作用。而「拒绝并不再询问」永远不点（点了这个权限就再也不弹，同意分支
+    无从验证）。
+
+    on_denied(key) 在点了第一次「拒绝」后回调，调用方据此把键持久化到会话上。
+
+    显式声明了 action 优先：声明 grant 就点允许；声明 deny 则**只拒一次**，第二次
+    同类框仍然翻成 grant —— 否则「先拒后允」的用例会永远卡在拒绝分支，第二次点不到
+    同意，用例必然失败。
 
     ## 每一轮只拍一次：截图 + dump 都在调用方
 
@@ -277,9 +381,11 @@ def handle(d, action: str | None = None, shot=None, on_dialog=None,
       `clicks` 是「点了哪几个权限」：每项 {text, rid, center}
     """
     result = {"detected": False, "handled": False, "clicks": [],
-              "dialog_count": 0, "buttons": [], "prompts": []}
+              "dialog_count": 0, "buttons": [], "prompts": [],
+              "phases": []}
     result["action"] = action or DEFAULT_ACTION
     result["action_source"] = "declared" if action else "default"
+    _denied = set(denied_keys or ())   # 本会话已拒过的权限类
     if shot is None:
         result["error"] = "handle() 需要 shot 回调"
         return result
@@ -307,10 +413,67 @@ def handle(d, action: str | None = None, shot=None, on_dialog=None,
             result["stuck"] = True
             break
 
-        btn = match_button(info["buttons"], result["action"])
+        # ── 两阶段推进：这一轮到底该点「拒绝」还是「允许」──────────────
+        # 人 2026-11-27 的裁决（原文）：「默认是点允许。图片视频拍照这种…
+        # 第一次点拒绝。第二次点同意。」以及「第一次点拒绝权限是不会发生变化的」。
+        # 所以：
+        #   · 媒体类权限（拍照/图片/视频）**第一次自动点普通「拒绝」**，
+        #     第二次同类框自动点「允许」—— 不需要 AI 声明、不需要 TTL 过期；
+        #   · 其它权限保持默认「允许」（拒一次就再也不弹，没法测同意分支）；
+        #   · AI 显式声明了 action 就按它来，但 deny 只生效一次，
+        #     第二次同类框照样翻成 grant，否则「先拒后允」永远卡在拒绝分支。
+        _key = dialog_key(info)
+        _declared = action or None          # 人显式声明的意图（None=没声明）
+        _seen = bool(_key) and _key in _denied    # 这一类已经拒过一次
+        _media = is_media_dialog(info)
+
+        if _seen:
+            # 这一类已经拒过 → 这一步必须点「允许」。
+            # 如果它本来该走拒绝（声明了 deny，或者是媒体类权限的第二阶段），
+            # 要显式标 phase_advanced：否则 AI 复盘时会以为工具没听它的声明，
+            # 反而自己去补点一次拒绝，把「先拒后允」又做回拒绝。
+            _phase_action = "grant"
+            if _declared == "deny" or _media:
+                result["phase_advanced"] = True
+        elif _declared == "deny":
+            # 人明确要验拒绝路径 —— 媒体类也好、其它也好，照点拒绝。
+            _phase_action = "deny"
+        elif _media and not _declared:
+            # 两阶段第一阶段：媒体类权限第一次出现，自动先点普通拒绝
+            #（不改授权状态，框下次还会再来），第二次才点允许。
+            _phase_action = "deny"
+            result["phase_first_deny"] = True
+        else:
+            _phase_action = "grant"
+        result["action"] = _phase_action
+        btn = match_button(info["buttons"], _phase_action)
+        if not btn and _phase_action == "deny":
+            # 这个框只有「拒绝并不再询问」这类永久拒绝项 —— 绝不点：点了该权限
+            # 再也不弹框，后面的「同意」分支就彻底没了（_system.md 的硬约束）。
+            # 这里**不记「已拒绝」**：拒绝分支其实没验到，记了会让下一个同类框
+            # 直接点允许，把「没测拒绝」伪装成「拒绝测过了」。
+            result["unmatched"] = True
+            result["unmatched_reason"] = (
+                "只有「拒绝并不再询问」这类永久拒绝项，点了就不会再弹框 —— "
+                "拒绝分支这次没验成，需要换前置（先 revoke 权限再重试）")
+            break
         if not btn:
             result["unmatched"] = True  # 框在，但没有可点的匹配项 → 交回 AI
             break
+
+        # 只有真的把「拒绝」点下去了，才算这一类权限「已拒绝过一次」。
+        if _phase_action == "deny" and _key:
+            _denied.add(_key)
+            result["phases"].append({"key": _key, "action": "deny",
+                                     "clicked": True, "text": btn["text"]})
+            if on_denied:
+                try:
+                    on_denied(_key)
+                except Exception:   # noqa: BLE001  记状态失败不该阻断点击
+                    pass
+        elif _phase_action == "grant" and result.get("phase_advanced"):
+            result["phases"].append({"key": _key, "action": "grant",
+                                     "clicked": True, "text": btn["text"]})
         before = sig
         try:
             d.click(*btn["center"])

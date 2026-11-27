@@ -62,6 +62,17 @@
               `serial` 为 null 或 `ime_ok: false` → 按 `advice` 处理，处理不好就报
               「这台设备现在跑不了」，不要硬派。
               
+              **另有两类是可选的，不设闸门、不能因此不派**：
+              
+              - 录屏（`recording.available: false`，缺 `scrcpy` / `ffprobe`）—— 只是这批会话
+                没有视频证据，用例照跑、结论照判。用户提出要录屏或要看视频时，把
+                `recording.install` 那条命令给用户并说明「装完重启 DSH 才生效」；
+                用户不装就说明「本批不录屏」，不要自己装、也不要因此拒绝派发。
+              - 其它 `recording` / `advice` 里写着「不影响执行」的项，同理只做告知。
+              
+              **只有硬失败才拦**：依赖缺到 `act` 都起不来、`storage` 写不进、
+              设备读不到、输入法不是 AdbKeyboard。其余一律「带着缺陷跑 + 在汇报里写明」。
+              
               批次跑完再检一次：会话有没有正常收尾、有没有停在 `running` 的残留。
               有残留先按下面「状态恢复」处理，再开下一批。
               
@@ -79,9 +90,11 @@
               - 命中 1–6 → 不派，报「编号 + 类别 + 原文证据 + 补齐建议」。
               - 隐含依赖（未声明的本机素材 / 联网解析服务）→ 只提醒，照常派。
               - **这几类不论 1–6 判成什么都不派**：玲珑岛 / 微动气泡（气泡、基础浮层、
-                扩展浮层、特殊天气推送）、UIUX 视觉稿比对、键盘输入、主题深浅模式、
+                扩展浮层、特殊天气推送）、UIUX 视觉稿比对、主题深浅模式、
                 3 分屏 / 4 分屏（设置后需重启设备才生效）。工具层现阶段不支持，
                 直接报「现阶段不支持」+ 请用例作者改。
+              - **文本输入不拦**：写文本、清空输入框（`text=""`）、改写内容都能做，
+                一律放行。只有明确要求「用外接实体键盘输入」或按快捷键组合才不派。
               
               细节以 `android-case-check` skill 为准 —— **派之前先加载它**，
               别凭记忆自己简化成更少的两三条。
@@ -183,7 +196,7 @@
               2. <用例文件名 2>
               3. <用例文件名 3>
               
-              ⚠️ 每条用例单独开会话：start → 跑这条 → findings-batch → finish，然后再 start 下一条。
+              ⚠️ 每条用例单独开会话：start → 跑这条 → check 逐条勾 → finish，然后再 start 下一条。
               设备状态按每条用例的「预置条件」准备，没写就不动。这条不用写进会话。
               
               ## 用例原文（原样执行，不要改写）
@@ -436,26 +449,37 @@
                             派给你 3 条用例，不是开一个会话连跑 3 条：
                             
                             ```
-                            start → 跑第 1 条 → findings-batch → finish
-                            start → 跑第 2 条 → findings-batch → finish
-                            start → 跑第 3 条 → findings-batch → finish
+                            start → 跑第 1 条 → check 逐条勾 → finish
+                            start → 跑第 2 条 → check 逐条勾 → finish
+                            start → 跑第 3 条 → check 逐条勾 → finish
                             ```
                             
                             记录、步骤回放、`_steps.yaml`、通过率都按会话切分：一个会话塞两条，
                             两条的步骤会混进同一份回放，`_steps.yaml` 只落第一条，事后也没法按用例查历史。
                             
                             - ❌ 不要为省时间把两条并进一个会话
-                            - ❌ 不要用一次 `findings-batch` 把两条用例的预期混着记
+                            - ❌ 不要一次把两条用例的预期混着记
                             - 设备状态由用例的「预置条件」决定（写着清除数据 / 首次启动才清），
                               它和开会话是两件事，不要混。
                             
-                            ### finding 一条对一条预期
+                            ### 一条预期勾一次：`check` 当场勾，证据绑当下这一帧
                             
-                            用例的每条预期记一条 finding，`expect_id` 用**这条用例预期的序号（1 起）**，
-                            不是原文里印的编号 —— 原文编号可能从 2 开始、可能是「1~2」这种区间，
-                            序号才是稳定的对齐键。
+                            用例有几条预期，就跑几次 `check`：
                             
-                            `event_id` 必须是本会话真实发生过的事件，边做边抄，不要事后补、不要空数组。
+                            ```
+                            & "<target>\.venv\Scripts\python.exe" "<target>\tools\session.py" check --status PASS --expect-id 3 --actual "activity=XxxActivity；sig 有 rid=iv_add_hint"
+                            ```
+                            
+                            - `--expect-id` 是**这条用例预期的序号（1 起）**，不是原文里印的编号 —— 原文编号可能从
+                              2 开始、可能是「1~2」这种区间，序号才是稳定的对齐键。不知道序号先跑 `checklist`。
+                            - **不用传 `event_id`**：工具自动绑「当下这一帧」。参数里根本没有 `--event`，所以没法
+                              回头挑一帧更好看的旧图。
+                            - **两次勾选之间必须真看一眼**：中间没有新的看/动事件，`check` 会拒绝（"不能连着打勾"）。
+                              节奏是「做一步 → 看一眼 → 勾一条」。
+                            - 没勾完就 `finish --status PASS` 会被拦下，点名哪几条没勾。真没机会验的用 `BLOCKED`
+                              并在 summary 写明原因。
+                            - 只有 `check` 覆盖不到的场景（一条预期要凑多帧历史证据）才用
+                              `finding` / `findings-batch`，那时才需要显式传 `--event-id`（边做边抄，不要事后补、不要空数组）。
                             
                             ### `start` 报「已有运行中的会话」
                             
@@ -556,7 +580,7 @@
                             ```powershell
                             Set-Content -Path "<target>\storage\tmp\case.txt" -Value "<原文>" -Encoding utf8
                             & "<target>\.venv\Scripts\python.exe" "<target>\tools\session.py" start --title "<标题>" --package "<包名>" --input "@<target>\storage\tmp\case.txt"
-                            & "<target>\.venv\Scripts\python.exe" "<target>\tools\session.py" findings-batch --file "<target>\storage\tmp\facts.json"
+                            & "<target>\.venv\Scripts\python.exe" "<target>\tools\session.py" check --status PASS --expect-id 1 --actual "<当帧看到什么>"
                             & "<target>\.venv\Scripts\python.exe" "<target>\tools\session.py" finish --status PASS --summary "<结论 + 设备当前停留状态>"
                             ```
                             
@@ -570,9 +594,17 @@
                             
                             `android_act` 走完会自动点掉权限弹窗，这一层不用管，也不必为此加步骤。
                             
-                            要测「拒绝」路径时，用 `permAction="deny"` 声明本次意图（需要区分权限类型时
-                            再加 `perm="<类型>"`），分支跑完用 `session.py perm-intent --clear` 清掉 ——
-                            不清的话同一会话后面每一步都会按 deny 点。
+                            **媒体类权限（拍照 / 相机 / 图片 / 相册 / 视频）工具会自动「先拒后允」**：同一类权限
+                            第一次弹框自动点普通「拒绝」（不改授权状态，框下次还会来），第二次弹框自动点「允许」。
+                            进度按弹框的申请文案记在会话上、跨步骤有效 —— 这一层你不用声明，也不要手工去点。
+                            
+                            其它权限（通知、定位、联系人等）默认直接点「允许」；要测它们的拒绝分支，用
+                            `permAction="deny"` 声明本次意图（需要区分权限类型时再加 `perm="<类型>"`）。声明后
+                            同类权限也只拒一次，第二次照样自动翻成「允许」——「先拒后允」永远走得完。
+                            `session.py perm-intent --clear` 会同时清意图与两阶段进度。
+                            
+                            只剩「拒绝并不再询问」这类永久拒绝项时工具**绝不点**（点了该权限永不再弹，同意分支
+                            就没了），会标 `unmatched` 交回你：先 `android_perm` revoke 再重触发，不要手工点它。
                             
                             `android_perm` 只在**弹窗根本不会出现**时用：
                             

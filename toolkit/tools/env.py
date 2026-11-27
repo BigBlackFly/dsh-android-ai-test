@@ -67,6 +67,66 @@ def _deps_ok() -> str:
 IME_OK = "com.github.uiautomator/.AdbKeyboard"
 
 
+# 录屏（宿主侧）：scrcpy 录、ffprobe 校验成品。缺了只少一份视频，
+# 用例照跑 —— 所以它是**可选依赖**，不进 deps_ok，也不该拦住任何派发。
+RECORDING_DEPS = [("scrcpy", "Genymobile.scrcpy", "录屏"),
+                  ("ffprobe", "Gyan.FFmpeg", "视频校验")]
+
+
+def _recording() -> dict:
+    """录屏链路在不在 —— 直接复用录制模块自己的查找逻辑。
+
+    为什么复用而不是各查各的：`_find_scrcpy()` 除了 PATH 还回退扫 WinGet 包目录
+    （IDE 起的进程常常没继承用户 PATH）。env 用自己的查法，就会出现
+    "env 说没有、录屏却录上了" 的分叉 —— AI 便去装一个本来就有的东西。
+    """
+    try:
+        import video_recording
+    except Exception as exc:  # noqa: BLE001
+        return {"available": False, "missing": [k for k, _, _ in RECORDING_DEPS],
+                "advice": f"录屏模块不可用：{exc}"}
+
+    found, missing, versions = {}, [], []
+    finders = {"scrcpy": video_recording._find_scrcpy,
+               "ffprobe": video_recording._ffprobe_path}
+    for key, _pkg, use in RECORDING_DEPS:
+        path = finders[key]()
+        if path:
+            found[key] = path
+            versions.append(f"{key} " + (_version_of(path) or "?"))
+        else:
+            missing.append(key)
+            versions.append(f"{key} 缺（{use}不可用）")
+
+    out = {"available": not missing, "scrcpy": found.get("scrcpy"),
+           "ffprobe": found.get("ffprobe"), "missing": missing,
+           "version": " · ".join(versions),
+           "impact": "录屏是可选证据：缺了用例照跑，只是这批会话没有视频"}
+    if missing:
+        out["install"] = (
+            "winget install --id Genymobile.scrcpy --source winget"
+            " ; winget install --id Gyan.FFmpeg --source winget")
+        out["advice"] = ("录屏不可用（缺 " + ",".join(missing) + "）—— 不影响执行，"
+                         "要录就装；装完重启 DSH（PATH 才会进环境）")
+    return out
+
+
+def _version_of(exe: str) -> str:
+    """取版本号；拿不到就返回空串（只用于展示，不参与判断）。"""
+    import re
+    import subprocess
+    flag = "--version" if Path(exe).name.lower().startswith("scrcpy") else "-version"
+    try:
+        done = subprocess.run([exe, flag], capture_output=True, text=True, timeout=8)
+    except (subprocess.SubprocessError, OSError):
+        return ""
+    text = (done.stdout or done.stderr or "").strip().splitlines()
+    if not text:
+        return ""
+    match = re.search(r"\d+\.\d+(?:\.\d+)?", text[0])
+    return match.group(0) if match else text[0][:30]
+
+
 def _storage_source() -> str:
     """storage/ 是按哪条规则定下来的 —— 和 runtime._resolve_storage_root() 的三档对应。
 
@@ -212,6 +272,8 @@ def main() -> None:
             # ★ 每次工具调用背后的 shell 是谁 —— 落在 5.1 就是每次白付 1.4 秒
             "shell_exe": _shell,
             "storage_source": _storage_source(),
+            # ★ 可选：录屏链路。缺了不影响执行，只在 note 里报一句
+            "recording": _recording(),
         })
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return
@@ -275,6 +337,18 @@ def main() -> None:
         print(f"  输入法   = {dev['ime'] or '(空)'} {mark}")
     if dev["advice"]:
         print(f"  ⚠️ {dev['advice']}")
+    print()
+
+    # ── 录屏（可选）─────────────────────────────────────────────
+    #
+    # 放在设备之后：录屏是跑起来才用的，先确认设备在不在。
+    # 缺依赖不标 ⚠️ —— 它不是故障，只是少一份证据。
+    rec = _recording()
+    if rec["available"]:
+        print(f"录屏     : ✅ {rec['version']}")
+    else:
+        print(f"录屏     : ❌ 缺 {','.join(rec['missing'])} —— 用例照跑，只是没有视频")
+        print(f"           装：{rec['install']}")
     print()
 
     # ── shell 解释器：决定每一次工具调用的固定开销 ────────────────

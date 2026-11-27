@@ -54,8 +54,9 @@ def _write_json(path: Path, value: dict) -> None:
                     raise
                 time.sleep(0.025 * (attempt + 1))
             finally:
-                if temp.exists() and attempt == 7:
-                    temp.unlink(missing_ok=True)
+                # 成功路径已 os.replace 走了；走到这里说明这次没成，
+                # 留着半截文件只会让下次 reconcile 把它当成品。
+                temp.unlink(missing_ok=True)
 
 
 def _ffprobe_path() -> str | None:
@@ -159,9 +160,11 @@ def start_video_recording(serial: str | None, record_dir: Path,
         return {"started": False, "reason": "未找到 scrcpy；请将 scrcpy 加入 PATH 或安装 WinGet 版本"}
     record_dir = Path(record_dir).resolve()
     video_dir = record_dir / "video"
-    video_dir.mkdir(parents=True, exist_ok=True)
-    if recording_status(video_dir).get("state") == "recording":
+    # 先看一眼有没有正在跑的：此刻还不用建目录，否则被拒绝的 start
+    # 会在 run_history 里留下一个空 video/，看上去像"录过但没录到东西"。
+    if video_dir.is_dir() and recording_status(video_dir).get("state") == "recording":
         return {"started": True, "already_running": True, "note": "本会话录屏已在运行"}
+    video_dir.mkdir(parents=True, exist_ok=True)
     (video_dir / "stop.flag").unlink(missing_ok=True)
     cmd = [sys.executable, str(Path(__file__).resolve()), "--worker",
            "--serial", serial, "--video-dir", str(video_dir), "--scrcpy", scrcpy]
@@ -213,12 +216,16 @@ def _stop_result(video_dir: Path, status: dict) -> dict:
     }
     if state == "partial":
         result["note"] = "录制中途中断，已保留可用片段（不代表录制完整）"
-    if state == "error" or (state != "complete" and not stopped):
+    # ★ 「失败」必须有 reason，且不能自相矛盾：
+    #   旧写法在 state=complete、segments=0 时给出 stopped=false + complete=true 且无 reason，
+    #   调用方拿到两个对立字段却没有任何解释。
+    if not stopped:
         error = status.get("error") or "未找到有效视频片段"
-        if state == "partial":
-            result["error"] = status.get("error") or error
-        else:
-            result["reason"] = error
+        if state == "complete":
+            error = f"录制已收尾，但没有可用的视频片段（segments=0）"
+        result["reason"] = error
+    elif status.get("error"):
+        result["error"] = status["error"]
     return result
 
 
@@ -316,8 +323,10 @@ def _launch_segment(scrcpy: str, serial: str, current_file: Path, video_dir: Pat
     attempts = 2
     last_error = "scrcpy 未能开始录制"
     for attempt in range(1, attempts + 1):
-        # Keep scrcpy's live display window visible while recording to file.
-        cmd = [scrcpy, "--serial", serial, "--record", str(current_file),
+        # 录到文件就够，不要 scrcpy 的实时窗口：它会浮在桌面上挡住被测界面、
+        # 白占一份 adb 视频通道，而且取证截图里一旦把它拍进去就是噪声。
+        # 排查时用 worker.log，不看那个窗口。
+        cmd = [scrcpy, "--serial", serial, "--no-window", "--record", str(current_file),
                "--record-format", "mp4", "--video-bit-rate", BIT_RATE,
                "--max-size", str(MAX_SIZE), "--capture-orientation=@"]
         log_path = video_dir / "worker.log"

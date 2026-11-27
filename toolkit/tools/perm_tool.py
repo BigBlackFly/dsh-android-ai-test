@@ -47,10 +47,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from common import apply_stdin_args, ensure_utf8_stdio  # noqa: E402
+from perm import PERMISSION_PREFIX as PREFIX, resolve_perm  # noqa: E402
 
 ensure_utf8_stdio()
-
-PREFIX = "android.permission."
 
 # `dumpsys package <pkg>` 里运行时权限段的样子：
 #
@@ -67,11 +66,13 @@ _PERM_LINE = re.compile(
 
 
 def _full_name(name: str) -> str:
-    """短名补全成 android.permission.XXX；已经是全名就原样返回。"""
-    name = name.strip()
-    if not name:
-        return ""
-    return name if name.startswith(PREFIX) else PREFIX + name
+    """权限名归一 —— 委托给 `perm.resolve_perm`（与 state.py 共用同一份表）。
+
+    ★ 2026-11-26：这里原来是「只补前缀、不映射、不大写」，
+    传 `media_images` 会得到 `android.permission.media_images`（真名是
+    READ_MEDIA_IMAGES），`pm grant` 静默失败却记成 done —— 调用方以为授好了。
+    """
+    return resolve_perm(name)
 
 
 def _split(value: str | None) -> list[str]:
@@ -99,8 +100,18 @@ def runtime_permissions(serial: str | None, package: str) -> dict:
     # 只取 runtime permissions: 到下一个两空格缩进的段标题之间
     m = _RUNTIME_BLOCK.search(out)
     if not m:
-        # 包不存在 / 还没被安装过 → dumpsys 里根本没这段
-        return {"ok": True, "perms": {}}
+        # 没有 runtime 段有两种情况，必须分开报：
+        #   ① 包根本不存在（dumpsys package <pkg> 什么也没有）
+        #   ② 包在，但没申请过一个运行时权限
+        # 旧代码把两者都当成 {ok: True, perms: {}}，于是「包名打错了」
+        # 会显示成「这个包的运行时权限 0/0 已授予」—— 看着像查成功了。
+        mark = out.strip()
+        if not mark or "Unable to find package" in mark or "not found" in mark.lower():
+            return {"ok": False,
+                    "error": f"包 {package} 在设备上不存在（dumpsys package 无输出）；"
+                             f"先用 android_env() / adb shell pm list packages | "
+                             f"Select-String {package} 确认包名"}
+        return {"ok": True, "perms": {}, "note": "该包没有申请过运行时权限"}
     rest = out[m.end():]
     nxt = _NEXT_BLOCK.search(rest)
     block = rest[:nxt.start()] if nxt else rest
@@ -184,12 +195,12 @@ def main() -> None:
     if args.json:
         import json
         print(json.dumps(result, ensure_ascii=False))
-        return
+        sys.exit(0 if result.get("ok") else 1)
 
     # 人读格式
     if not result.get("ok"):
         print(f"❌ {result.get('error')}")
-        return
+        sys.exit(1)
     print(f"包名：{args.package}")
     if grant:
         print(f"  已授予：" + (", ".join(result.get("granted_via_adb") or []) or "(无)"))

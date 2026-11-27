@@ -441,6 +441,7 @@ def main() -> None:
     #    下一轮 shot() 自然覆盖 act 目录，最后留下的（无框）当 act 证据。
     perm_result = None
     _perm_steps: list[str] = []
+    _perm_snap_errors: list[str] = []
     png, xml, meta = evidence_paths(args.dir, args.name)
 
     def _snap_perm_dialog(info, btn) -> None:
@@ -469,8 +470,10 @@ def main() -> None:
                       "buttons": _buttons, "clicked": btn},
                      rel(_p), None, _ts)
             _perm_steps.append(_p.parent.name)
-        except Exception:  # noqa: BLE001  证据不该阻断点框主流程
-            pass
+        except Exception as _snap_error:  # noqa: BLE001  证据不该阻断点框主流程
+            # N-18：不阻断 ≠ 不记录。旧写法整体 `pass`，弹窗画面转存失败时
+            # 事件里既没有这一步、也没有任何痕迹，事后只看到"点了没反应"。
+            _perm_snap_errors.append(str(_snap_error))
 
     def _shot_for_perm():
         """拍一份 dump+截图并**直接落成本次 act 的证据**，返回 (xml_text, payload)。
@@ -485,19 +488,59 @@ def main() -> None:
         return xml.read_text(encoding="utf-8"), _captured
 
     _captured = None                    # 已拍好的采集结果，避免拍第二遍
+    perm_intent_expired = False         # 声明的权限意图已过期（要写进 detail）
     if _is_click:
         try:
             from db import current_session, get_db
             si = current_session()
             intent = get_db().get_perm_intent(si) if si else None
+            # ⚠️ 过期不进默认分支：`get_perm_intent` 现在过期也返回 action，
+            #    带 expired=True。照声明执行但**必须在日志里喊出来** ——
+            #    否则「声明过 deny、实际点了允许」会像旧版一样悄无声息
+            #    （N-15：10 分钟后静默反转成 grant，这条用例其实没测拒绝路径）。
+            if intent and intent.get("expired"):
+                perm_intent_expired = True
             import perm as _perm
+            # ★ 2026-11-27 两阶段（人明确裁决）：同一类媒体权限「第一次拒绝、
+            #   第二次同意」。已拒过的键持久化在会话上，不靠 TTL 过期这种副作用。
+            _db = get_db()
+            _denied = _db.perm_denied_keys(si) if si else set()
+
+            def _on_denied(key: str, _sid=si) -> None:
+                """第一次点了某类权限的「拒绝」——立刻记到会话上。
+
+                必须在**点完就当步**记下来：这条用例下一个动作触发同类权限框时，
+                要靠它翻成「同意」；只写在内存里的话，中间隔着别的 tool 进程就丢了。
+                """
+                if _sid:
+                    _db.mark_perm_denied(_sid, key)
+
             perm_result = timed_call(
                 "permission", _perm.handle, d,
                 intent["action"] if intent else None,
                 shot=_shot_for_perm, on_dialog=_snap_perm_dialog,
-                settle_s=0.3)
+                settle_s=0.3, denied_keys=_denied, on_denied=_on_denied)
+            if intent and intent.get("expired"):
+                # 交给下面的 detail 拼接用（handle 的返回体里不带 TTL）
+                perm_result["perm_intent_ttl_s"] = intent.get("ttl_s")
         except Exception as e:  # noqa: BLE001
-            perm_result = {"error": str(e)}
+            # N-18：权限流程自己抛异常时**不能悄悄丢掉这条结果**。
+            # 旧写法只塞 {"error": ...}，而下面所有消费点（detail / 落库 /
+            # payload）都先看 `detected` —— 于是这条结果既不进 detail，
+            # 也不进事件，复盘时只剩一个"点了但没反应"的裸动作。
+            # detected=None 表示"判不了"（≠ 没有弹窗），配合 error 字段，
+            # 让 detail、事件和 payload 三处都喊出来。
+            perm_result = {"detected": None, "error": str(e),
+                           "error_kind": "permission_flow_failed"}
+    # 有没有权限相关的事要上报：真的检测到弹窗，或者流程自己出错了
+    _perm_reported = bool(perm_result) and bool(
+        perm_result.get("detected") or perm_result.get("error"))
+    if _perm_reported and perm_result.get("error"):
+        detail += (f" · ⚠️ 权限流程异常（弹窗可能已出现但没处理）："
+                   f"{perm_result['error']}")
+    if _perm_snap_errors:
+        detail += (" · ⚠️ 权限弹窗画面转存失败（这一步没留下独立证据）："
+                   + "; ".join(_perm_snap_errors[:2]))
     if perm_result and perm_result.get("detected"):
         clk = ", ".join(c["text"] for c in perm_result.get("clicks") or [])
         src = "（默认）" if perm_result.get("action_source") == "default" else ""
@@ -508,6 +551,12 @@ def main() -> None:
             detail += f" 未匹配可点按钮，可见: {perm_result.get('buttons')}"
         else:
             detail += " 未点击"
+        if perm_intent_expired:
+            # 让「声明的意图已过期、这步仍按旧声明执行」留下痕迹：
+            # 人复盘时能看出「这条拒绝路径其实是在声明 30 分钟后才验的」。
+            detail += (" · ⚠️ 权限意图已过期（声明超过 "
+                       f"{perm_result.get('perm_intent_ttl_s') or '?'} 秒），"
+                       "本次仍按旧声明执行 —— 拒绝/同意路径请确认是否正确")
         # 告诉 AI 后台存了哪几个权限步。不说的话它会在 summary 里写
         # 「没有留下独立步骤」——账实不符（实测踩过，跑 168 时）。
         if _perm_steps:
@@ -515,6 +564,15 @@ def main() -> None:
             detail += f" · 已存权限步 {', '.join(_perm_steps)}"
         if perm_result.get("stuck"):
             detail += " · ⚠️弹窗点不动（内容无变化），可能被遮挡"
+        # ★ 两阶段推进必须让 AI 看得见：这一步点了「允许」不是因为它声明了
+        #   grant，而是因为同类权限上一次已经拒过了。不说清楚，AI 复盘时会
+        #   以为工具没听它的 deny 声明，反而自己去补点拒绝。
+        if perm_result.get("phase_advanced"):
+            _pk = (perm_result.get("phases") or [{}])[-1].get("key") or ""
+            detail += (f" · 🔄同一权限第二次出现（{_pk}）—— 上一次已拒过，"
+                       "这次按固定规则点【允许】")
+        if perm_result.get("unmatched_reason"):
+            detail += " · " + perm_result["unmatched_reason"]
 
     try:
         if _captured is not None:
@@ -564,7 +622,7 @@ def main() -> None:
         info = {**info, "watch": watch_result}
     if perm_inline:
         info = {**info, "perm_intent_set": perm_inline}
-    if perm_result and perm_result.get("detected"):
+    if _perm_reported:
         info = {**info, "permission": perm_result}
     # 落库前先读一屏：nodes + 文字 + 可点清单 + 身份签名（`kind=value` 集合）。
     # 用途：①签名随事件一起存，事后能认出当时停在哪一页；
@@ -585,6 +643,8 @@ def main() -> None:
     # 让 AI 不必再读 dump 自己认页面（那是会话时长的大头 —— 实测 58~64% 花在
     # 两次调用之间的判断上）。命中与否都返回，但**不阻断**：工具只报事实，
     # 由 AI 决定继续还是修正（测试里"实际发生了什么"比"帮它走通"重要）。
+    # `--expect` 的写法错误在解析 argv 时就已由 common._expect_arg 拦掉，
+    # 走到这里的一定是合法规格。
     _ck = checkpoint.evaluate(checkpoint.parse_expect(getattr(args, "expect", None)),
                               activity=info.get("activity"), sig=_sig)
     if _ck["checked"]:
@@ -644,14 +704,16 @@ def main() -> None:
                 "⚠️ 落点与预期不符：未命中 " + "; ".join(_ck["missed"]) + "。"
                 "先判断是「多余的临时弹窗」（不影响主流程 → 关掉继续）还是"
                 "「用例要的东西不存在了」（主流程被改 → 停止并如实记录）。")
-    if perm_result and perm_result.get("detected"):
+    if _perm_reported:
         payload["permission"] = perm_result
-        if not (perm_result.get("clicks") or []):
+        if perm_result.get("detected") and not (perm_result.get("clicks") or []):
             payload["permission_hint"] = (
-                "检测到系统权限弹窗但**没有自动点击**：弹窗里没有可匹配的按钮"
-                f"（可见 {perm_result.get('buttons')}）。"
-                "若是要测「拒绝」路径，用 perm-intent --action deny 后重触发；"
-                "否则看 buttons 自己决定点哪个。")
+                "检测到系统权限弹窗但**没有自动点击**。"
+                f"可见按钮：{perm_result.get('buttons')}。"
+                "常见原因：这个框只剩「拒绝并不再询问」这类永久拒绝项"
+                "（工具绝不点它 —— 点了该权限再也不弹，「同意」分支就没了）。"
+                "此时先把权限 revoke 掉再重触发，让它回到普通「拒绝/允许」形态；"
+                "不要手工去点「拒绝并不再询问」。")
     if failure:
         # 硬性终止信号：AI 必须立即 finish(BLOCKED)，不要再发下一个 act
         payload["terminate"] = True

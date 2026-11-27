@@ -14,9 +14,11 @@ act --watch 的弹窗内点击。全部操作自动记入当前会话事件流�
 from __future__ import annotations
 
 import argparse
+import sys
 
 from common import (add_common_args_all_subcommands, apply_stdin_args, connect,
                     emit, fail, guard_terminated, log_auto)
+from perm import PERMS, resolve_perm
 from runtime import execution
 
 
@@ -28,21 +30,9 @@ try:
 except Exception:  # noqa: BLE001  common 不可用时不要因此崩掉
     pass
 
-PERMS = {
-    "camera": "android.permission.CAMERA",
-    "location": "android.permission.ACCESS_FINE_LOCATION",
-    "coarse_location": "android.permission.ACCESS_COARSE_LOCATION",
-    "mic": "android.permission.RECORD_AUDIO",
-    "contacts": "android.permission.READ_CONTACTS",
-    "storage": "android.permission.READ_EXTERNAL_STORAGE",
-    "media_images": "android.permission.READ_MEDIA_IMAGES",
-    "notifications": "android.permission.POST_NOTIFICATIONS",
-}
-
-
-def resolve_perm(v: str) -> str:
-    """支持短名（camera/location/...）与全名两种写法。"""
-    return PERMS.get(v, v)
+# PERMS / resolve_perm 现在由 perm.py 提供（perm_tool.py 共用同一份）。
+# 旧版这里只有 `PERMS.get(v, v)`：短名大小写不对就直接当全名用，
+# 传 `CAMERA` 会拼出 `pm grant <pkg> CAMERA` 这种无效命令。
 
 
 def _perm_granted(d, pkg: str, perm: str) -> bool:
@@ -57,6 +47,19 @@ def _perm_granted(d, pkg: str, perm: str) -> bool:
         if line.startswith(perm) and "granted=" in line:
             return "granted=true" in line
     return False
+
+
+def _emit_result(ok: bool, payload: dict) -> None:
+    """输出结果；**失败必须以非零退出码结束**。
+
+    `emit()` 只往 stdout 写 `ok:false`，退出码仍是 0 —— 调用方（插件层、
+    批量脚本）看到 0 就当成功，于是「撤销权限没生效」「清数据没成功」
+    这类前置失败会被静默吞掉，后面的判定全建在没铺好的状态上。
+    这里把失败接成 rc=1，业务细节原样留在 JSON 里。
+    """
+    emit(ok, payload)
+    if not ok:
+        sys.exit(1)
 
 
 def main() -> None:
@@ -109,15 +112,20 @@ def main() -> None:
                 hint = ("⚠️ 回读校验未达预期（granted=" + str(granted) + "）——预置未生效，"
                         "该权限可能不是 runtime 权限或设备策略限制；"
                         "改走弹窗路径（act --watch），不要对未预置的状态做判定")
-            emit(ok, {"cmd": args.cmd, "perm": perm, "output": out,
-                      "granted": granted, "verified": True, "hint": hint})
+            _emit_result(ok, {"cmd": args.cmd, "perm": perm, "output": out,
+                              "granted": granted, "verified": True, "hint": hint})
             return
         elif args.cmd == "clear":
             out = (d.shell(f"pm clear {args.package}").output or "").strip()
             ok = "Success" in out
             execution("executed")
             log_auto("state", "state clear", f"pm clear {args.package}", {"ok": ok})
-            emit(ok, {"output": out, "hint": "应用已回到首次使用态（含外部 Android/data）"})
+            # hint 必须跟着 ok 走：原来不论成败都说「已回到首次使用态」，
+            # 失败的 clear 会被当成前置已铺好，后面的判定全建在沙子上。
+            hint = ("应用已回到首次使用态（含外部 Android/data）" if ok
+                    else f"⚠️ pm clear 未成功（输出：{out[:200] or '(空)'}）——"
+                         "应用数据可能没被清掉，不要假定已回到首次使用态")
+            _emit_result(ok, {"output": out, "hint": hint})
         elif args.cmd == "start":
             comp = f"{args.package}/{args.activity}" if args.activity else args.package
             d.app_start(args.package, args.activity) if args.activity else d.app_start(args.package)

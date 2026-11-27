@@ -296,7 +296,10 @@ def _search_one(filepath: Path, query: str | None,
             # 拿着近似命中当精确答案用（这正是「给错的比不给更糟」）。
             return {**base, "mode": "section", "found": True,
                     "section": sec["title"], "exact": exact,
-                    "line": sec["start"], "content": body[:4000]}
+                    "line": sec["start"],
+                    # content 与 body 同值：读卡契约对外承诺的字段名是 body
+                    # （原样 query 模式的用法），这里给别名免得 AI 取不到。
+                    "content": body[:4000], "body": body[:4000]}
         return {**base, "mode": "section", "found": False}
 
     if query:
@@ -486,6 +489,43 @@ def _log_baseline(rec: dict) -> None:
         pass
 
 
+def _flatten_card(out: dict) -> dict:
+    """把单次 `_card_mode` 的结果拍平成与「多节」相同的顶层结构。
+
+    读卡有两种输入形态（一个 --section / 多个 --section），但**只该有一种输出形态**：
+    `--section` 传一个走 `cards[]`、传两个换成 `{content, found, sections_asked}`，
+    等于把「你传了几个节」的知识转嫁给调用方 —— AI 照第一种写法取 `cards`，
+    遇到第二种直接 KeyError。这里统一成后者的结构，并保留 `cards` 原样
+    （想看来源/行号的人照样能拿到）。
+    """
+    parts: list[str] = []
+    found: list[dict] = []
+    fuzzy: list[str] = []
+    for c in out.get("cards") or []:
+        label = c.get("source") or "?"
+        if c.get("content"):
+            parts.append(f"【{label}】{c.get('section') or ''}\n{c['content']}")
+            found.append({"source": label, "asked": out.get("section"),
+                          "title": c.get("section"), "exact": c.get("exact"),
+                          "chars": len(c["content"])})
+            if c.get("exact") is False:
+                fuzzy.append(out.get("section") or "")
+        for m in c.get("matches") or []:
+            found.append({"source": label, "asked": out.get("query"),
+                          "title": m.get("title"), "score": m.get("score")})
+            parts.append(f"【{label}】{m.get('title')}\n"
+                         f"{m.get('body') or m.get('preview') or ''}")
+        for sec in c.get("toc") or []:
+            found.append({"source": label, "asked": None, "title": sec.get("title"),
+                          "line": sec.get("line")})
+    flat = {**out,
+            "content": "\n\n" + ("\n" + "─" * 56 + "\n").join(parts),
+            "found": found}
+    if fuzzy and fuzzy[0]:
+        flat["fuzzy_sections"] = fuzzy
+    return flat
+
+
 def main() -> int:
     """跑 _main()，把它打印的 JSON 原样透出，同时记一行基线。"""
     started = time.perf_counter()
@@ -582,6 +622,9 @@ def _main() -> int:
             [args.section] if args.section else [None])
         if len(secs) == 1:
             out = _card_mode(args.card, args.query, secs[0], args.grep)
+            if out.get("ok"):
+                # 拍平：单节与多节走同一套顶层结构，AI 不必记两套取法。
+                out = _flatten_card(out)
         else:
             merged: dict = {"ok": True, "mode": "card",
                             "package": args.card,
@@ -635,7 +678,9 @@ def _main() -> int:
                 "要看某个具体文件请改用 --path 而不给 --card；"
                 "要读某一节给 --section")
         print(json.dumps(out, ensure_ascii=False))
-        return 0
+        # 「找不到这张卡」是失败，不是空结果：调用方按退出码判定时必须失败。
+        # 否则 AI 拿到 ok:false 却看到 rc=0，会当成「读到了但没用」继续往下走。
+        return 0 if out.get("ok") else 1
 
     if not args.path:
         print(json.dumps({

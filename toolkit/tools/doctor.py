@@ -212,9 +212,44 @@ def _assets(package: str | None) -> None:
         d = CASES_DIR / package
         if not d.is_dir():
             check(SOFT, "指定包用例", f"{d} 不存在", "确认包名拼写，或该包还没导入用例")
-        for card in (KNOWLEDGE_DIR / f"{package}.md", KNOWLEDGE_DIR / "paths" / f"{package}.md"):
-            check(INFO if card.is_file() else SOFT, "知识卡",
-                  f"{card} " + ("在" if card.is_file() else "缺（首次跑会自动长出来）"))
+        # 只看真的会被读的那张卡：知识卡目录下 <包名>.md。
+        # 别再加 paths/ 这类"以后可能长出来"的位置 —— 没人创建它，
+        # 于是 --package 每次都多一条永久 WARN、把 rc 顶成 1，真问题反而看不见了。
+        card = KNOWLEDGE_DIR / f"{package}.md"
+        check(INFO if card.is_file() else SOFT, "知识卡",
+              f"{card} " + ("在" if card.is_file() else "缺（首次跑知识卡会自动生成）"))
+
+
+def _recording() -> None:
+    """宿主侧录屏链路：scrcpy 录、ffprobe 校验成品。
+
+    为什么是 WARN 而不是 FAIL：录屏只是辅助证据。缺了用例照样能跑、结论照样成立，
+    所以不能让它把 doctor 的退出码推到 2 —— 那样会让一个装不上 scrcpy 的机器
+    看起来"整套工具层不能用"，最后演变成去关掉录屏或干脆不跑。
+
+    为什么复用 video_recording 的查找逻辑：那边除了 PATH 还回扫 WinGet 包目录
+    （IDE 起的进程常常没继承用户 PATH）。这里自己再查一遍，就会出现
+    "doctor 说没有、录屏却录上了" 的分叉。
+    """
+    try:
+        import video_recording
+    except Exception as exc:  # noqa: BLE001
+        check(SOFT, "录屏链路", f"模块不可用：{exc}", "录屏会关掉，其余功能不受影响")
+        return
+    finders = {"scrcpy": (video_recording._find_scrcpy, "Genymobile.scrcpy", "录"),
+               "ffprobe": (video_recording._ffprobe_path, "Gyan.FFmpeg", "校验")}
+    found, missing = [], []
+    for key, (finder, pkg, use) in finders.items():
+        path = finder()
+        (found.append(f"{key} {path}") if path else missing.append((key, pkg, use)))
+    if not missing:
+        check(INFO, "录屏链路", " / ".join(found))
+        return
+    check(SOFT, "录屏链路",
+          "缺 " + ",".join(k for k, _, _ in missing) + "（录屏不可用，其余功能正常）",
+          "要录就装："
+          + " ; ".join(f"winget install --id {pkg} --source winget" for _, pkg, _ in missing)
+          + "   装完重启 DSH。不影响执行 —— 不装也能跑用例")
 
 
 def _shell() -> None:
@@ -260,6 +295,7 @@ def main() -> int:
     _harness()
     _db()
     _device()
+    _recording()
     _shell()
     _assets(args.package)
 

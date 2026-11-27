@@ -18,12 +18,12 @@ import sys
 from pathlib import Path
 
 from common import (case_expectations, emit, find_case_file_by_ref,
-                    knowledge_hint, match_expect_id, resolve_case_stem,
+                    knowledge_hint, knowledge_hint_key, match_expect_id, resolve_case_stem,
                     steps_hint)
 import sqlite3
 from db import (  # noqa: I001
     INTERIM, STATUSES, SessionDB, clear_current, current_session, get_db,
-    set_current,
+    run_dir_missing, run_dir_path, set_current,
 )
 from runtime import (
     CASES_DIR, STORAGE_DIR, current_record_dir,
@@ -34,7 +34,7 @@ from video_recording import start_video_recording, stop_video_recording
 
 # 只有这几条不写盘。其余一律进门先实测 storage 可写性 ——
 # 否则报错点会漂到后面某个不相干的调用上，根本看不出是 storage 的问题。
-_READ_ONLY_CMDS = frozenset({"list", "current"})
+_READ_ONLY_CMDS = frozenset({"list", "current", "checklist"})
 
 # Windows 控制台默认 GBK，中文/特殊符号会炸 → 全部 CLI 输出强制 UTF-8
 try:
@@ -237,8 +237,90 @@ def _resolve_expect_id(db, session_id: int, expect_text: str,
     return hit["id"], hit["label"]
 
 
-def export_steps(db, session_id: int) -> str | None:
-    """把本轮「能复用的跳转步骤」导成 `<md文件名>_steps.yaml`，返回写到的路径。
+def _checklist(db, session_id: int) -> list[dict]:
+    """用例的预期清单 × 本会话已记的结论 —— 这就是 checklist。
+
+    ★ 不另建表：清单就是 `sessions.user_input` 里那段「预期结果」，
+    用 `common.case_expectations` 拆条（复合预期按 `；` / `。` 拆开）；
+    「勾没勾」就等于「findings 里有没有 expect_id 指向它」。清单随 case 走，
+    不随会话走 —— 所以不需要额外的存储，也不需要迁移。
+
+    返回 `[{id, label, text, status, finding_id, actual}]`，按用例原文顺序。
+    原文里解析不出预期段时返回 `[]`（调用方按「无可对账清单」处理）。
+    """
+    row = db.get_session(session_id) or {}
+    exps = case_expectations(row.get("user_input"))
+    if not exps:
+        return []
+    hits = {f.get("expect_id"): f for f in db.findings_of(session_id)
+            if f.get("expect_id")}
+    out: list[dict] = []
+    for exp in exps:
+        finding = hits.get(exp["id"]) or {}
+        out.append({"id": exp["id"], "label": exp["label"], "text": exp["text"],
+                    "status": finding.get("status"),
+                    "finding_id": finding.get("id"),
+                    "actual": finding.get("actual") or ""})
+    return out
+
+
+def _pending(items: list[dict]) -> list[dict]:
+    """还没记结论的预期（没有对应 finding）—— 就是「没勾的项」。"""
+    return [it for it in items if not it.get("status")]
+
+
+def _check_gate(db, session_id: int) -> tuple[dict | None, str]:
+    """勾选前的两道硬校验，返回 `(当前帧事件, 拒绝原因)`。
+
+    ★ 这里的两个判断都是结构性的，不看语义：
+
+    ① **两次勾选之间必须产生新的看/动事件** —— 否则就是会话末尾连着打勾。
+       判据只比 seq：上一条 finding 的证据 seq 必须严格小于本次除 check 之外
+       的最大 seq。不需要新列（上一条 finding 的证据事件本来就在库里）。
+    ② **证据只能是当下这一帧** —— 取最后一条带证据的事件，参数里**不提供**
+       `--event`，所以从设计上就没法回头挑一个「更有利」的旧帧。
+    """
+    events = db.list_events(session_id)
+    if not events:
+        return None, ("本会话还没有任何事件 —— 先 observe 或 act 一步，"
+                      "勾选必须绑在当下这一帧上")
+    by_id = {e.get("id"): e for e in events}
+    # check 事件不算「看/动」：把它算进去，"连着打勾"的判据就永远成立不了了。
+    cur_max = max((e.get("seq") or 0) for e in events
+                  if e.get("kind") != "check")
+    last_seq = 0
+    for finding in db.findings_of(session_id):
+        for eid in finding.get("event_ids") or []:
+            ev = by_id.get(eid)
+            if ev:
+                last_seq = max(last_seq, ev.get("seq") or 0)
+    if last_seq and cur_max <= last_seq:
+        return None, (
+            "自上一次勾选之后没有产生新的看/动事件 —— 不能连着打勾。"
+            "先做一步（observe 或 act）看到新状态，再勾下一条。"
+            "为什么卡这个：会话末尾连着打勾时，人只能凭记忆回填，"
+            "证据必然从前面挑，判出来的结论和当帧对不上。")
+    frame = None
+    for ev in reversed(events):
+        if ev.get("evidence"):
+            frame = ev
+            break
+    if frame is None:
+        return None, ("本会话还没有任何带证据的事件（截图/视图树）—— "
+                      "先 observe 或 act 一步；只读文本的调用留不下可判的证据")
+    return frame, ""
+
+
+def export_steps(db, session_id: int) -> tuple[str | None, str]:
+    """把本轮「能复用的跳转步骤」导成 `<md文件名>_steps.yaml`。
+
+    ★ N-06：返回 `(path, skip_reason)` 而不是裸 `str | None`。
+    原来三处 `return None` 是**静默**的 —— 会话跑完在 finish 的输出里
+    完全看不出「这次没导出步骤」，下次跑同一条用例才发现没有 `_steps.yaml`，
+    却不知道是哪一轮、为什么没生成。现在每一处都给出原因，由 finish
+    写进 `self_check`，人和 AI 都能看见。
+
+    返回：`(路径, "")` 成功；`(None, 原因)` 没导出。
 
     ## 存什么
 
@@ -276,7 +358,7 @@ def export_steps(db, session_id: int) -> str | None:
     row = db.get_session(session_id) or {}
     pkg = (row.get("package") or "").strip()
     if not pkg:
-        return None
+        return None, "会话没有记录被测包名，不知道该写进哪个用例目录"
 
     rows = db.list_events(session_id) or []
     steps: list[dict] = []
@@ -389,7 +471,9 @@ def export_steps(db, session_id: int) -> str | None:
         steps.append(item)
 
     if not steps:
-        return None
+        return None, ("本轮没有「锚点明确 + 落点可验」的跳转步骤"
+                      "（AI 没写 --expect，且点击前后 activity 没变）"
+                      "—— 不是出错，是这次没什么可复用的")
 
     # ★ 去重：同一对 (via, expect) 只留**最后**一次。
     #
@@ -425,8 +509,11 @@ def export_steps(db, session_id: int) -> str | None:
     title = str(row.get("title") or "")
     stem = resolve_case_stem(pkg, title, row.get("user_input"))
     if not stem:
-        # 解析不出对应用例 md —— 不硬造一个孤儿产物（WebUI 里只会是空白条目）
-        return None
+        # 解析不出对应用例 md —— 不硬造一个孤儿产物（WebUI 里只会是空白条目）。
+        # 但要**说清是哪一步没成**，否则下次发现没 yaml 只能靠猜。
+        return None, (f"解析不出对应的用例 md 文件名（title={title!r}）—— "
+                      f"{pkg} 的用例目录里没有能对上的 md；"
+                      f"标题里带个用例编号或完整用例名就能对上")
     out_dir = CASES_DIR / pkg
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"{stem}_steps.yaml"
@@ -462,7 +549,11 @@ def export_steps(db, session_id: int) -> str | None:
         "# 用法：照着点即可。每步点之前验 expect，不命中就停、交回 AI。",
         "# 注意：这是**上一次**的实测路径，不是唯一正确路径。",
         f"case: {stem}",
-        f"source_run: {Path(str(db.path)).parent.name}",
+        # ★ 2026-11-26：这里原来是 `Path(str(db.path)).parent.name`，
+        #   db.path 是 `storage/test.db` → 恒等于 "storage"。57/57 个
+        #   _steps.yaml 全是 `source_run: storage`，等于这个字段没信息量。
+        #   正确来源是这一轮的运行目录名（run_id），回放时才找得到证据。
+        f"source_run: {row.get('run_id') or 'unknown'}",
         f"last_run: {row.get('started_at') or ''}",
         f"verdict: {row.get('status') or ''}",
         f"step_count: {len(steps)}",
@@ -483,7 +574,7 @@ def export_steps(db, session_id: int) -> str | None:
             # 不用等 activity 变化。
             lines.append("    in_page: true")
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return f"assets/cases/{pkg}/{out.name}{drop_note}"
+    return f"assets/cases/{pkg}/{out.name}{drop_note}", ""
 
 
 
@@ -531,6 +622,29 @@ def main() -> None:
                         "只有自动对不上、而你确定是第几条时才手填")
     s.add_argument("--id", type=int, default=None,
                    help="记录到指定会话（不给就记到当前会话）")
+
+    # ★ 勾 checklist：一个验证点勾一次，证据自动绑当下这一帧。
+    #
+    # 与 `finding` 的区别只有两点，但正是这两点堵住了假 PASS：
+    #   ① 证据不用传（也传不了）—— 自动取最后一条带证据的事件；
+    #   ② 每勾一次之间必须有过新的看/动事件，禁止会话末尾集中补写。
+    #
+    # 为什么需要它：全库 397 个多断言会话里 354 个（89.2%）的 finding 是
+    # 会话结束那一刻一次性写进去的 —— 写的时候手上没有"当帧"，只能从历史里
+    # 挑看起来最像的那一帧。实测就出了 #619/#1169 这种拿"点击后"的帧去证
+    # "进入即应显示"的假 PASS。
+    s = sub.add_parser("check", help="勾一条预期：证据自动绑当下这一帧")
+    s.add_argument("--status", required=True, choices=STATUSES)
+    s.add_argument("--expect-id", type=int, default=None, dest="expect_id",
+                   help="清单里第几条预期（1 起，看 checklist 的输出）")
+    s.add_argument("--expect", default="",
+                   help="不想数编号就给预期文本，会自动对到清单里的某一条")
+    s.add_argument("--actual", default="")
+    s.add_argument("--note", default="")
+    s.add_argument("--id", type=int, default=None, help="指定会话（默认当前）")
+
+    s = sub.add_parser("checklist", help="看这条用例的预期清单勾到哪了")
+    s.add_argument("--id", type=int, default=None, help="指定会话（默认当前）")
 
     # ★ 批量记断言：一次调用写多条
     #
@@ -824,12 +938,18 @@ def main() -> None:
         #   所以不是让 AI 自己猜、也不是在 SKILL 里写死"Windows 用 PS"，
         #   而是在开场把探测结果直接给它。
         out["env"] = detect_shell()
-        # 知识卡浮现：有卡就提示路径 + 小节索引（只提示一次，见 common.knowledge_hint）
-        hint = knowledge_hint(args.package)
+        # 知识卡浮现：有卡就提示路径 + 小节索引（按卡键去重，见 common.knowledge_hint_key）
+        #
+        # ★ N-05：去重键从「会话级布尔」改成「按卡」。这里 args.package 可能为空
+        #   （start 时还没看到设备），那就 key="" 不提示、不落标记，
+        #   留给第一个 observe 补 —— 与原来的行为一致。
+        _kkey = knowledge_hint_key(args.package)
+        hint = (knowledge_hint(args.package, shown_keys=db.knowledge_hint_keys(sid))
+                if _kkey else None)
         if hint:
             out["knowledge_hint"] = hint
             # 只要发出了 hint 就落标记（无卡包也有 system_card 提示，同样别重复发）
-            db.mark_knowledge_shown(sid)
+            db.mark_knowledge_hint(sid, _kkey)
         # 上次走过的跳转步骤：纯参考，不自动执行。
         # 每次跑同一条用例，AI 都要重新摸「更多按钮在哪、菜单里哪个是课程表」——
         # 这些是机械跳转，finish 时已经导出到 steps.yaml，开场给它看。
@@ -853,6 +973,87 @@ def main() -> None:
                              expect_id=_eid, expect_label=_elab)
         emit(True, {"finding_id": fid, "evidence_event_ids": args.event_id,
                     "expect_id": _eid, "expect_label": _elab})
+    elif args.cmd == "check":
+        sid = args.id if getattr(args, "id", None) else current_session()
+        if not sid:
+            raise SystemExit("没有进行中的会话，先 session.py start（或用 --id 指定）")
+        items = _checklist(db, sid)
+        if not items:
+            raise SystemExit(
+                "这条用例的原文里解析不出「预期结果」段，没有可勾的清单。\n"
+                "  常见原因：start 时没传 --case，或 user_input 不是用例原文。\n"
+                "  这种情况用 session.py finding --status ... --expect ... --event-id ... 记")
+        target = None
+        if args.expect_id is not None:
+            for item in items:
+                if item["id"] == args.expect_id:
+                    target = item
+                    break
+            if target is None:
+                raise SystemExit(f"清单里没有第 {args.expect_id} 条预期"
+                                 f"（共 {len(items)} 条，先跑 checklist 看一遍）")
+        else:
+            _text = maybe_file(args.expect)
+            if not _text.strip():
+                raise SystemExit("要指定勾哪一条：--expect-id N（或 --expect \"预期文本\"）")
+            _eid, _ = _resolve_expect_id(db, sid, _text, None)
+            if _eid is None:
+                raise SystemExit(
+                    "这句 expect 对不上用例原文的任何一条预期。\n"
+                    "  先跑 checklist 看清单原文，再用 --expect-id N 指定")
+            for item in items:
+                if item["id"] == _eid:
+                    target = item
+                    break
+        if target["status"]:
+            raise SystemExit(
+                f"第 {target['id']} 条已经勾过了（{target['status']}，"
+                f"finding #{target['finding_id']}）。\n"
+                "  判错了就在 summary 里写「更正 finding#N」，不要重复占位。")
+        frame, why = _check_gate(db, sid)
+        if frame is None:
+            raise SystemExit(why)
+        _expect_text = f"预期{target['label']} {target['text']}".strip()
+        fid = db.add_finding(sid, args.status, _expect_text,
+                             maybe_file(args.actual), maybe_file(args.note),
+                             event_ids=[frame["id"]],
+                             expect_id=target["id"], expect_label=target["label"])
+        # 勾选本身留一条轻量事件（不带证据），事后能看出"什么时候勾的"。
+        # ⚠️ 它 kind=check，不参与 _check_gate 的「新事件」判据。
+        db.log_event(sid, "check", "session check",
+                     f"勾第{target['id']}条 → {args.status}"
+                     f"（证据 event {frame['id']} / seq {frame.get('seq')}）",
+                     data={"expect_id": target["id"], "status": args.status,
+                           "event_id": frame["id"], "finding_id": fid})
+        left = _pending(_checklist(db, sid))
+        out = {"ok": True, "finding_id": fid, "expect_id": target["id"],
+               "expect_label": target["label"], "status": args.status,
+               "evidence_event_id": frame["id"],
+               "evidence_seq": frame.get("seq"),
+               "remaining": len(left),
+               "remaining_ids": [it["id"] for it in left]}
+        if left:
+            out["hint"] = ("还剩 %d 条没勾：%s —— 一条一条来，每条都先看到新状态"
+                           % (len(left), "、".join(f"预期{it['label']}" for it in left)))
+        else:
+            out["hint"] = "清单已全部勾完，可以 finish 了"
+        emit(True, out)
+    elif args.cmd == "checklist":
+        sid = args.id if getattr(args, "id", None) else current_session()
+        if not sid:
+            raise SystemExit("没有进行中的会话（或用 --id 指定）")
+        items = _checklist(db, sid)
+        if not items:
+            raise SystemExit("这条用例的原文里解析不出「预期结果」段，没有清单")
+        left = _pending(items)
+        emit(True, {
+            "session_id": sid, "total": len(items), "done": len(items) - len(left),
+            "pending": len(left),
+            "items": [{"id": it["id"], "label": it["label"],
+                       "text": it["text"][:120],
+                       "status": it["status"] or "未勾",
+                       "finding_id": it["finding_id"]} for it in items],
+        })
     elif args.cmd == "findings-batch":
         # 一次写多条断言。任何一条不合法就整批不写（避免写一半）。
         sid = args.id if getattr(args, "id", None) else current_session()
@@ -930,10 +1131,36 @@ def main() -> None:
         summary = maybe_file(args.summary)
         _session_row = db.get_session(sid) or {}
         _run_id = _session_row.get("run_id")
-        _video_dir = STORAGE_DIR / "run_history" / str(_run_id) if _run_id else None
-        _video_result = stop_video_recording(_video_dir) if _video_dir else {
-            "stopped": False, "reason": "当前会话没有 run_id"}
+        # ★ N-11：旧会话的 run_id 是 hex12，单库化后指向的目录**早就不存在**。
+        #   照着拼只会在后面白等录屏 timeout、并给 unpin_record 一个假路径。
+        #   目录不在就不拼（_video_dir=None），并把这件事写进返回，让人看得见。
+        _stale_run = bool(_run_id) and run_dir_missing(_run_id)
+        _video_dir = None if _stale_run else run_dir_path(_run_id)
+        # ★ checklist 对账：判 PASS 时清单必须全勾完。
+        #   漏勾的预期 = "这条根本没验证" —— 按四态语义那是 BLOCKED，不是 PASS。
+        #   放在 finish_session 之前拦：那一步已经会因「PASS 却含非 PASS finding」
+        #   报错，但报的是内部口径，不如这里直接点名哪几条没勾。
+        _items = _checklist(db, sid)
+        _pend = _pending(_items)
+        if _items and _pend and args.status == "PASS":
+            raise SystemExit(
+                "还有 %d 条预期没勾，不能判 PASS：\n  %s\n"
+                "  每条预期都要有自己的一条结论；漏勾说明这条没验证到。\n"
+                "  真没机会验的（前置不成立 / 进不去 / 崩溃），结论用 BLOCKED "
+                "并在 summary 里写明原因。"
+                % (len(_pend),
+                   "\n  ".join(f"预期{it['label']} {it['text'][:60]}"
+                               for it in _pend)))
         ok = db.finish_session(sid, args.status, summary, args.package)
+        # ★ 录屏收尾必须在结论落库**之后**：停止要等 scrcpy 把 MP4 尾写好，
+        #   正常一两秒，scrcpy 卡住时要等到 timeout。放在前面，
+        #   这份等待就白压在最关键的"把结论存下来"上 —— 关窗、超时、崩溃，
+        #   丢的是用例结论，而不是一段视频。
+        _video_result = (stop_video_recording(_video_dir, timeout=15)
+                         if _video_dir else {"stopped": False,
+                                             "reason": ("运行目录已不存在（stale run_id）"
+                                                        if _stale_run
+                                                        else "当前会话没有 run_id")})
         cleanup_warning = None
         try:
             clear_current(sid)
@@ -942,8 +1169,17 @@ def main() -> None:
         crash_n = db.count_crash_events(sid)
         stats = db.finding_stats(sid)
         self_check = []
+        if _items and _pend:
+            self_check.append(
+                "ℹ️ 还有 %d 条预期没勾（%s）—— 判 PASS 时会被拦下"
+                % (len(_pend), "、".join(f"预期{it['label']}" for it in _pend)))
         if cleanup_warning:
             self_check.append(cleanup_warning)
+        # ★ 解绑"当前 record"指针 —— 只有指针确实属于本会话才解。
+        #   不清的后果：下一次不属于任何会话的 observe/act 会误接到上一次的目录里。
+        #   带 owner 的后果（N-02）：**不带 owner 会误删别人还在跑的指针**，
+        #   被删的那个会话后续证据会落到 _orphan/，而且没有任何报错。
+        unpin_record(_video_dir)
         # 操作效率自查（SKILL.md「执行节奏」）：
         # 只提示不阻断 —— 效率差不等于用例结论错，但**必须让人看见**，
         # 否则"跑得很脏"会悄悄过去（实测有的会话 44% 的 act 是无效试探）。
@@ -974,7 +1210,12 @@ def main() -> None:
             if _kind == "diag":
                 steps_note = "（diag 会话，跳过步骤导出）"
             else:
-                steps_note = export_steps(db, sid)
+                steps_note, _skip = export_steps(db, sid)
+                # ★ N-06：没导出也要说为什么，别静默。
+                #   原来 export_steps 返回 None 就什么都不写，跑完一轮
+                #   在 finish 输出里完全看不出「这次没生成 _steps.yaml」。
+                if not steps_note and _skip:
+                    self_check.append(f"ℹ️ 步骤未导出：{_skip}")
         except Exception as e:  # noqa: BLE001
             self_check.append(f"⚠️ 步骤导出失败：{e}")
 
@@ -985,18 +1226,31 @@ def main() -> None:
                         "无关包崩溃仅需在报告中说明")
                if crash_n else "无崩溃事件"}
         out["video_recording"] = _video_result
+        # 旧会话（hex12 run_id）的运行目录早已不存在：显式报出来，
+        # 免得人以为"录屏没启动"或"证据丢了"，实际是那代记录本来就没有。
+        if _stale_run:
+            out["stale_run_id"] = True
+            out["stale_note"] = ("该会话的 run_id 属于旧记录格式，"
+                                 "对应的 run_history 目录已不存在 —— "
+                                 "没有可收尾的录屏，证据回放也不可用。"
+                                 "结论与 finding 不受影响。")
         if steps_note:
             out["steps_exported"] = steps_note
-            out["steps_note"] = (
-                "已把本轮「锚点明确+落点可验」的跳转步骤导出。"
-                "下次跑同一条用例可以直接照着点这几步，"
-                "前置条件/造数据/判定不在里面（那些每次不一样）。")
+            # ★ 只有**真的导出成功**才说导出。旧写法只看 steps_note 非空，
+            #   而 diag 会话的 steps_note 是「（diag 会话，跳过步骤导出）」
+            #   —— 于是同一份输出里既说「跳过导出」又说「已把步骤导出」，
+            #   自相矛盾（2026-11-27 真机验证时实测到）。
+            if steps_note.startswith("assets/"):
+                out["steps_note"] = (
+                    "已把本轮「锚点明确+落点可验」的跳转步骤导出。"
+                    "下次跑同一条用例可以直接照着点这几步，"
+                    "前置条件/造数据/判定不在里面（那些每次不一样）。")
         emit(True, out)
         # ★ 会话收尾 -> 清掉"当前 record"指针。
         #
         #   不清的后果：下一次不属于任何会话的 observe/act
         #   会误接到上一次的目录里，把这次的证据写进历史运行。
-        unpin_record()
+        #   （解绑动作在函数开头就做了，见 unpin_record(_video_dir) 那处）
     elif args.cmd == "abandon":
         sid = args.id if getattr(args, "id", None) else current_session()
         if not sid:
@@ -1013,8 +1267,10 @@ def main() -> None:
             # 已经有结论了：绝不覆盖人写过的判定，只把指针解绑。
             if cur == sid:
                 clear_current(sid)
-            unpin_record()
+            unpin_record(None if run_dir_missing(row.get("run_id"))
+                         else run_dir_path(row.get("run_id")))
             emit(True, {"session_id": sid, "status": status,
+                        "stale_run_id": run_dir_missing(row.get("run_id")),
                         "note": f"会话 #{sid} 已是结论态（{status}），"
                                 f"abandon 不覆盖已写的结论；本次只解绑了指针"})
             raise SystemExit(0)
@@ -1027,14 +1283,18 @@ def main() -> None:
         # 这里跟着让步，别让人卡在一个想不通的 ValueError 上。
         final = "BLOCKED" if row.get("terminated") else "ERROR"
         _run_id = row.get("run_id")
-        _video_dir = STORAGE_DIR / "run_history" / str(_run_id) if _run_id else None
+        _stale_run = bool(_run_id) and run_dir_missing(_run_id)
+        _video_dir = None if _stale_run else run_dir_path(_run_id)
         _video_result = stop_video_recording(_video_dir) if _video_dir else {
-            "stopped": False, "reason": "当前会话没有 run_id"}
+            "stopped": False,
+            "reason": ("运行目录已不存在（stale run_id）" if _stale_run
+                       else "当前会话没有 run_id")}
         db.finish_session(sid, final, f"作废：{reason}")
         if cur == sid:
             clear_current(sid)
-        unpin_record()
+        unpin_record(_video_dir)
         emit(True, {"session_id": sid, "status": final, "reason": reason,
+                    "stale_run_id": _stale_run,
                     "video_recording": _video_result,
                     "note": ("已作废收尾，不计入用例通过率；"
                              + ("该会话曾被崩溃终止，按规矩落 BLOCKED；"
@@ -1069,17 +1329,24 @@ def main() -> None:
                 # 崩溃终止过的只能落 BLOCKED（finish_session 的规矩）
                 final = "BLOCKED" if s["terminated"] else "ERROR"
                 _run_id = (db.get_session(s["id"]) or {}).get("run_id")
-                _video_result = (stop_video_recording(STORAGE_DIR / "run_history" / _run_id)
-                                 if _run_id else {"stopped": False,
-                                                  "reason": "run_id 不存在"})
                 db.finish_session(s["id"], final, reason)
+                # 录屏收尾放结论之后，且用短超时：reap 是设备卡死时的救命命令，
+                # 批量回收 N 个会话不能每个都等满默认 timeout。视频是辅助证据，
+                # 收不干净也不该拖住回收本身。
+                _video_dir = (None if run_dir_missing(_run_id)
+                              else run_dir_path(_run_id))
+                _video_result = (stop_video_recording(_video_dir, timeout=5)
+                                 if _video_dir else {"stopped": False,
+                                                     "reason": ("运行目录已不存在（stale run_id）"
+                                                                if _run_id else "run_id 不存在")})
             except (ValueError, sqlite3.Error, OSError) as e:  # noqa: PERF203
                 failed.append({"id": s["id"], "error": str(e)})
                 continue
             if cur == s["id"]:
                 clear_current(s["id"])
-                unpin_record()
+                unpin_record(_video_dir)
             done.append({"id": s["id"], "status": final,
+                         "stale_run_id": bool(_run_id) and run_dir_missing(_run_id),
                          "video_recording": _video_result,
                          "idle_min": s["idle_min"], "events": s["events"]})
         emit(not failed, {"reaped": done, "failed": failed,
@@ -1090,28 +1357,63 @@ def main() -> None:
         sid = args.id if getattr(args, "id", None) else current_session()
         if not sid:
             raise SystemExit("没有进行中的会话（或用 --id 指定）")
+        # ⚠️ --id 指向不存在的会话时必须报错，不能 ok:true（旧版会）。
+        #    被人拿来确认"意图已声明"时，ok:true 会造成完全错误的印象。
+        if not db.get_session(sid):
+            emit(False, {"session_id": sid, "error": "会话不存在",
+                         "hint": "用 session.py list 查看有效会话号"})
+            raise SystemExit(1)
         if args.clear:
             db.clear_perm_intent(sid)
+            # ★ 2026-11-27：两阶段的「这一类已经拒过」也要一起清 ——
+            #   换分支（测完拒绝再测同意）或从头重测时，残留的 denied 键会让
+            #   下一个同类权限框直接被翻成「允许」，拒绝分支就再也测不到了。
+            db.clear_perm_denied(sid)
+            db.log_event(sid, "perm", "perm-intent",
+                         "权限意图已清除，并重置两阶段状态（已拒过的权限类清零）")
             print(json.dumps({"ok": True, "session_id": sid, "intent": None,
-                              "note": "权限意图已清除"}, ensure_ascii=False))
+                              "denied_keys": [],
+                              "note": "权限意图与两阶段状态均已清除：此后遇到权限弹窗"
+                                      "回到【默认同意】，且同类权限会重新从「拒绝」开始"},
+                              ensure_ascii=False))
         elif args.show or not args.action:
             cur = db.get_perm_intent(sid)
-            print(json.dumps({"ok": True, "session_id": sid, "intent": cur,
-                              "hint": "声明：perm-intent --action grant|deny [--perm 类型]"
-                              } if cur else {
-                                  "ok": True, "session_id": sid, "intent": None,
-                                  "hint": "当前无意图：遇到权限弹窗只会记录、不会点击"},
-                             ensure_ascii=False))
+            # ★ 两阶段状态也要看得见：只报意图不报 denied 键，运维会以为
+            #   「声明了 deny 就一定会点拒绝」，而第二次同类框其实点的是允许。
+            _denied = sorted(db.perm_denied_keys(sid))
+            if cur:
+                # 过期也照样报出来，并说清"这步会怎么执行"
+                out = {"ok": True, "session_id": sid, "intent": cur,
+                       "denied_keys": _denied,
+                       "hint": ("声明仍有效：后续 act 遇到权限弹窗自动点"
+                                f"【{'同意' if cur['action'] == 'grant' else '拒绝'}】"
+                                + ("；⚠️ 已过期，但仍按此声明执行，动作日志会标 ⚠️"
+                                   if cur["expired"] else ""))}
+            else:
+                # 旧提示写的是"只会记录、不会点击"——与实际相反（默认会点同意）。
+                out = {"ok": True, "session_id": sid, "intent": None,
+                       "denied_keys": _denied,
+                       "hint": "当前未声明意图：遇到权限弹窗会按【默认同意】自动点击；"
+                               "同类媒体权限第一次仍会先点「拒绝」（两阶段固定规则），"
+                               "第二次才点「允许」。要强制走拒绝分支，"
+                               "先 perm-intent --action deny 声明。",
+                       "default_action": "grant"}
+            print(json.dumps(out, ensure_ascii=False))
         else:
             ok = db.set_perm_intent(sid, args.action, args.perm)
             db.log_event(sid, "perm", "perm-intent",
                          f"权限意图: {args.action}"
                          + (f"（{args.perm}）" if args.perm else ""))
             print(json.dumps({"ok": ok, "session_id": sid,
-                              "intent": {"action": args.action, "permission": args.perm},
+                              "intent": {"action": args.action, "permission": args.perm,
+                                         "expires_in_s": db.PERM_INTENT_TTL_S},
                               "hint": (f"后续 act/observe 遇到权限弹窗将自动点"
                                        f"【{'同意' if args.action == 'grant' else '拒绝'}】"
-                                       f"；分支测完请 perm-intent --clear")},
+                                       f"；有效期 {db.PERM_INTENT_TTL_S:.0f} 秒，"
+                                       f"超过后仍按此声明执行但动作日志会标 ⚠️；"
+                                       f"声明 deny 时同类权限只拒一次 —— "
+                                       f"第二次出现会自动改点「允许」（两阶段固定规则）；"
+                                       f"分支测完请 perm-intent --clear")},
                              ensure_ascii=False))
     elif args.cmd == "list":
         print(json.dumps(db.list_sessions(20), ensure_ascii=False, indent=2))

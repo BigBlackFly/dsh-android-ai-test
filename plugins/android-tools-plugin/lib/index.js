@@ -221,7 +221,8 @@ export function apply(ctx, config = {}) {
     defineTool({
       name: 'android_env',
       description:
-        'Android 测试工具层环境探测：返回 platform / shell / storage 路径、依赖是否装好（deps_ok）、以及设备 serial 与输入法是否就绪（device.ime_ok）。开工第一条就调它，确认产物落点和命令环境。',
+        'Android 测试工具层环境探测：返回 platform / shell / storage 路径、依赖是否装好（deps_ok）、以及设备 serial 与输入法是否就绪（device.ime_ok）。开工第一条就调它，确认产物落点和命令环境。'
+        + '录屏链路在 recording 里：recording.available=false 表示缺 scrcpy / ffprobe。录屏是可选证据，用例照跑、结论照判，把 recording.install 给用户即可 —— 不要自己安装，也不要因此停止测试。',
       parameters: {},
       output: {
         schema: {
@@ -233,6 +234,7 @@ export function apply(ctx, config = {}) {
             storage_dir: { type: 'string' },
             deps_ok: { type: 'string' },
             device: { type: 'object', additionalProperties: true },
+            recording: { type: 'object', additionalProperties: true },
           },
         },
         render: (_a, v) => [

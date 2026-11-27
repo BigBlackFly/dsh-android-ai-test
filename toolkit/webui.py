@@ -14,6 +14,7 @@ import base64
 import json
 import os
 import re
+import shutil
 import socket
 import sys
 import urllib.parse
@@ -24,7 +25,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "tools"))
 from common import resolve_case_stem  # noqa: E402
-from db import SessionDB, get_db  # noqa: E402
+from db import SessionDB, get_db, run_dir_missing  # noqa: E402
 from runtime import KNOWLEDGE_DIR, STORAGE_DIR  # noqa: E402
 
 # ★ UTF-8 兜底：Windows 控制台默认 GBK，启动日志里 print 一个 ⚠️ 就崩。
@@ -37,6 +38,17 @@ except Exception:  # noqa: BLE001
     pass
 
 WEBUI_DIR = ROOT / "webui"
+
+
+def _read_slice(path: Path, start: int, length: int) -> bytes:
+    """从文件里只读 `[start, start+length)`，用于视频 Range 响应。
+
+    直接 `read_bytes()` 再切片会把整个 MP4 读进内存：单段录屏可达几百 MB，
+    播放器每拖一次进度条就是一个 Range 请求 —— 拖十次就是十份全文件。
+    """
+    with path.open("rb") as fh:
+        fh.seek(start)
+        return fh.read(length)
 # 目录一律从 runtime 导入（那里只有一处定义，随工作目录变化）。
 MD_NAME_RE = re.compile(r"^[\w\u4e00-\u9fff.\-]+\.md$")
 
@@ -290,14 +302,45 @@ def session_detail(sid: str, include_events: bool = True) -> dict | None:
     s = dict(s)
     s["local_id"] = s.get("id")
     s["run_id"] = s.get("run_id") or _rid or ""
+    s["stale_run_id"] = run_dir_missing(s.get("run_id"))
     s["has_video"] = _run_has_video(s.get("run_id"))
     return s
+
+
+# `_run_has_video` 的判定缓存：run_id -> (video 目录签名, 结论)
+# 会话列表一次要判几百条，而「有没有可用录屏」在两次渲染之间几乎不变。
+# 签名取 video/ 目录的 mtime_ns —— 录屏写入/收尾会动它，一变就重算。
+_VIDEO_FLAG_CACHE: dict[str, tuple[int, bool]] = {}
 
 
 def _run_has_video(run_id: str | None) -> bool:
     if not run_id or not re.fullmatch(r"[\w-]{1,80}", str(run_id)):
         return False
-    video_dir = STORAGE_DIR / "run_history" / str(run_id) / "video"
+    run_dir = STORAGE_DIR / "run_history" / str(run_id)
+    # 旧记录（hex12 run_id）的运行目录早就不存在了。不判这一下，
+    # 每次列表渲染都会为一个不存在的目录跑一次 reconcile + ffprobe。
+    if not run_dir.is_dir():
+        return False
+    video_dir = run_dir / "video"
+    # 绝大多数运行目录里根本没有 video/（从没录过屏）。先看目录在不在，
+    # 免得为它走一遍 reconcile：reconcile 里第一件事是 Path.resolve()，
+    # 而在 Windows 上对不存在的路径 resolve 要走一次 realpath，
+    # 几百条列表就是几百次 nt._getfinalpathname。
+    try:
+        signature = video_dir.stat().st_mtime_ns
+    except OSError:
+        _VIDEO_FLAG_CACHE.pop(str(run_id), None)
+        return False
+    key = str(run_id)
+    cached = _VIDEO_FLAG_CACHE.get(key)
+    if cached is not None and cached[0] == signature:
+        return cached[1]
+    answer = _probe_video_dir(video_dir)
+    _VIDEO_FLAG_CACHE[key] = (signature, answer)
+    return answer
+
+
+def _probe_video_dir(video_dir: Path) -> bool:
     try:
         from video_recording import reconcile_recording, _read_manifest, _validated_segments
         reconcile_recording(video_dir)
@@ -792,7 +835,7 @@ class Handler(BaseHTTPRequestHandler):
                 "via": via,
                 "why": act.get("why") or (j.get("prompt") or ""),
                 "detail": e.get("detail") or "",
-                # 图还在不在（被 cleanup 轮转/误删后为 False）
+                # 图还在不在（被手工清理/误删后为 False）
                 "ok": (ROOT / ev).is_file(),
             })
 
@@ -891,22 +934,25 @@ class Handler(BaseHTTPRequestHandler):
             # is_relative_to 而非 startswith：字符串前缀会放过同前缀兄弟目录
             if fp.is_relative_to(STORAGE_DIR) and fp.is_file():
                 if fp.suffix.lower() == ".mp4":
-                    data = fp.read_bytes()
+                    # ★ 按 Range 只读要的那一段，**不把整个文件读进内存**。
+                    #   录屏单段可到几百 MB，播放器拖一次进度条就是一个 Range 请求；
+                    #   旧写法 `fp.read_bytes()` 先全读再切片，拖 10 次读 10 份全文件。
+                    size = fp.stat().st_size
                     range_header = self.headers.get("Range", "")
                     match = re.match(r"bytes=(\d*)-(\d*)$", range_header)
                     if match:
                         start = int(match.group(1) or 0)
-                        end = int(match.group(2) or len(data) - 1)
-                        if start >= len(data) or end < start:
+                        end = int(match.group(2) or size - 1)
+                        if start >= size or end < start:
                             self.send_response(416)
-                            self.send_header("Content-Range", f"bytes */{len(data)}")
+                            self.send_header("Content-Range", f"bytes */{size}")
                             self.end_headers()
                             return
-                        end = min(end, len(data) - 1)
-                        chunk = data[start:end + 1]
+                        end = min(end, size - 1)
+                        chunk = _read_slice(fp, start, end - start + 1)
                         self.send_response(206)
                         self.send_header("Content-Type", "video/mp4")
-                        self.send_header("Content-Range", f"bytes {start}-{end}/{len(data)}")
+                        self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
                         self.send_header("Accept-Ranges", "bytes")
                         self.send_header("Content-Length", str(len(chunk)))
                         self.end_headers()
@@ -915,9 +961,11 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_response(200)
                     self.send_header("Content-Type", "video/mp4")
                     self.send_header("Accept-Ranges", "bytes")
-                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Content-Length", str(size))
                     self.end_headers()
-                    self.wfile.write(data)
+                    # 不带 Range 的整段请求也只能流式外发，不能先全读进内存
+                    with fp.open("rb") as vf:
+                        shutil.copyfileobj(vf, self.wfile, 1024 * 1024)
                     return
                 return self._send(200, fp.read_bytes(),
                                   MIME.get(fp.suffix, "application/octet-stream"))
@@ -993,7 +1041,11 @@ class Handler(BaseHTTPRequestHandler):
             run_id = s.get("run_id") or ""
             if not re.fullmatch(r"[\w-]{1,80}", str(run_id)):
                 return self._json({"error": "该记录没有有效的录屏目录"}, 404)
-            video_dir = STORAGE_DIR / "run_history" / str(run_id) / "video"
+            run_dir = STORAGE_DIR / "run_history" / str(run_id)
+            if not run_dir.is_dir():
+                return self._json({"error": "该记录的运行目录已不存在（旧格式记录，"
+                                            "没有可回放的录屏与证据）"}, 404)
+            video_dir = run_dir / "video"
             try:
                 from video_recording import reconcile_recording, _validated_segments
                 reconcile_recording(video_dir)

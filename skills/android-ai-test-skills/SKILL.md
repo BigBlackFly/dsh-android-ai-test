@@ -100,9 +100,9 @@ description: Android 真机 GUI 测试。当用户给出测试用例（步骤+�
 ② 执行：android_act 每次自动回传动作后的画面（截图 + dump + nodes）
    android_act(action="tap", x=<x>, y=<y>, via="rid=<目标 rid>", why="点保存")
 
-③ 记断言（按预期逐条记）→ ④ 收尾
+③ 勾断言（`check` 一条一条勾，见下文）→ ④ 收尾
    bash: & "<toolkit>\.venv\Scripts\python.exe" "<toolkit>\tools\session.py" `
-           findings-batch --file "<target>\storage\tmp\facts.json"
+           check --status PASS --expect-id 1 --actual "<这一帧看到什么>"
    bash: & "<toolkit>\.venv\Scripts\python.exe" "<toolkit>\tools\session.py" `
            finish --status FAIL --summary "<结论 + 设备当前状态>"
 ```
@@ -133,9 +133,9 @@ description: Android 真机 GUI 测试。当用户给出测试用例（步骤+�
 哪怕派给你的是 3-5 条，也是一条一条来，不是开一个会话连跑完。
 
 ```
-① start  → 跑第 1 条 → findings-batch → finish    ← 这条结束
-② start  → 跑第 2 条 → findings-batch → finish    ← 再开一个新的
-③ start  → 跑第 3 条 → findings-batch → finish
+① start  → 跑第 1 条 → check 逐条勾 → finish    ← 这条结束
+② start  → 跑第 2 条 → check 逐条勾 → finish    ← 再开一个新的
+③ start  → 跑第 3 条 → check 逐条勾 → finish
 ```
 
 设备状态怎么处理，**仍然由用例要求决定**（见「判据只有一条：用例要求了吗」）：
@@ -174,33 +174,50 @@ description: Android 真机 GUI 测试。当用户给出测试用例（步骤+�
   数据库查询（如 `content query`）只能作**辅助旁证**，不能替代界面观察得出的结论；
   两者不一致时（界面没有但库里有，或反之）要在 actual 里**写明这个矛盾**。
 
-#### ⭐ 多条断言一次写完（不要一条一条调）
+#### ⭐ 一个验证点勾一次：看到就当帧判，不要留到最后一起写
 
-**几条预期就写一个 JSON，一次提交**：
+**证据必须是「判这一条的那一刻」的那一帧，不是事后从历史里挑出来的。**
 
-```json
-[
-  {"status":"PASS","expect":"预期1 <原文>","actual":"activity=<实际页>","event_id":[13]},
-  {"status":"FAIL","expect":"预期2 <原文>","actual":"<N> 个节点 + 整屏 OCR 都没有该文案","event_id":[15,16]}
-]
-```
-
-写成 `<target>\storage\tmp\facts.json`，然后（bash）：
+每条预期走一条 `check`：
 
 ```powershell
 & "<toolkit>\.venv\Scripts\python.exe" "<toolkit>\tools\session.py" `
-    findings-batch --file "<target>\storage\tmp\facts.json"
+    check --status PASS --expect-id 3 --actual "activity=XxxActivity；sig 里有 rid=iv_add_hint"
 ```
 
-> 逐条调每次约 6 秒（AI 思考 + 进程冷启动），9 条断言要 50 秒以上。
+- `--expect-id N` 就是用例「预期结果」里的第 N 条（先跑 `checklist` 看清单原文）；
+  也可以改成 `--expect "预期3 原文"`，工具自己对到清单里的某一条。
+- **不用传 `event_id`**：工具自动绑「本条预期对应的当下这一帧」，所以事后永远凑不出证据。
+  （这是刻意的 —— 参数里根本没有 `--event`，想回头挑一帧更没有机会。）
+- 勾完整条用例前退不出去：**还有没勾的预期时判 PASS 会被 `finish` 拦下**。
+  真没机会验的（前置不成立 / 进不去 / 崩了），结论用 `BLOCKED` 并在 summary 写明原因。
 
-**`event_id` 必须是本会话真事件**（从 `android_observe` / `android_act` 返回的
-`event_ids` 里拿），拿错了整批会被拒。
+随时看进度：
 
-#### ⚠️ `event_id` 边做边抄，不要留到最后
+```powershell
+& "<toolkit>\.venv\Scripts\python.exe" "<toolkit>\tools\session.py" checklist
+```
 
-每次 `android_act` / `android_observe` 的返回里都有 `event_ids`。**做完一步就把用到的 ID 记在你的
-草稿里**（哪个 ID 证明哪条预期）。留到最后靠回忆去凑，一定会漏 —— 一处漏就整批被拒。
+输出里 `items` 每条有 `status`（`未勾` 或已经记下的结论）和 `pending`，对着它安排下一步。
+
+#### ⚠️ 两次勾选之间必须真看一眼
+
+**连着打勾会被拒**（「自上一次勾选之后没有产生新的看/动事件」）。
+
+原因很实在：会话末尾连着打勾时，手上没有「当帧」，只能凭记忆从前面挑证据 ——
+实测就是这么出的假 PASS（拿"点一下之后才出现"的帧去证"进入即应显示"）。
+
+所以节奏是：**做一步 → 看一眼 → 勾一条 → 再做下一步**。
+一条预期跨了好几步才验得到也没问题：最后那一步做完、看那一帧、再勾。
+
+> 为什么不再用 `findings-batch` 一口气写完：它天然鼓励"跑完再回忆"。真库里
+> 397 个多断言会话中有 354 个（89.2%）的 finding 是会话结束那一刻一次性写进去的。
+> `findings-batch` 仍然保留（`check` 覆盖不到的场景用它），但**正常路径是 `check`**。
+
+#### ⚠️ `event_id` 只在用 `finding`/`findings-batch` 时才要你抄
+
+这两个命令必须显式传 `--event-id`（从 `android_act` / `android_observe` 返回的
+`event_ids` 里拿），**边做边记，不要留到最后**。`check` 不需要。
 
 **`event_id` 不能是空数组**：PASS/FAIL 至少 1 个；`[]` 会被判「没有证据」整批打回。
 答不出 ID 说明这条预期当时没留证据 —— 那就不该判 PASS/FAIL，按前面的判定规则记 BLOCKED。
@@ -648,11 +665,21 @@ android_system(action="rotate", to="landscape")   # 切横竖屏，返回切换�
 
 **弹窗工具会自己点掉，你什么都不用做。**
 
+### 媒体类权限（拍照 / 图片 / 视频）：工具自动「先拒后允」
+
+用例只要走到这类权限，工具会按固定规则自动推进，**你什么都不用声明**：
+
+1. 同一类权限**第一次**弹框 → 自动点普通「拒绝」（不改授权状态，框下次还会来）；
+2. 同一类权限**第二次**弹框 → 自动点「允许」，走完同意分支。
+
+进度按弹框的申请文案记在这个会话上，跨步骤持久化；`session.py perm-intent --clear` 会把它一起清零。
+
 | 情况 | 你要做的 |
 |---|---|
 | 用例只测「功能能用」 | **不用管** |
-| 用例要测「拒绝」分支 | 动作时加 `permAction="deny"`（要指定权限类型再加 `perm="<类型>"`） |
-| 双分支用例（先拒后允） | 第二轮先 `android_state(action="revoke", package=<包名>, perm=<类型>)` 再跑；跑完用 bash `session.py perm-intent --clear` 清意图 |
+| 用例要测「拒绝」分支 | 动作时加 `permAction="deny"`（要指定权限类型再加 `perm="<类型>"`）—— 但你只需要声明一次，第二次同类框照样自动翻成「允许」 |
+| 双分支用例（先拒后允） | **不用管**，两阶段自动就是这个顺序；想重跑一遍先 `android_state(action="revoke", package=<包名>, perm=<类型>)` |
+| 只剩「拒绝并不再询问」可点 | 工具**绝不点**它（点了该权限永不再弹，同意分支就没了），会标 `unmatched` 交回你：先 revoke 再重触发，不要手工点它 |
 | 点了几次「拒绝」后**再也不弹框** | 这是系统机制，不是控件坏了。用 `android_perm` 查一次当前状态再判 |
 
 > ⚠️ **不要预先 grant**。真实用户第一次也是弹框，用例要验的就是这条真实路径。
@@ -782,6 +809,22 @@ abandon 不覆盖已写的结论」）—— 所以先 finish 再想作废，来
 > 别为了让数字对上，跑去改别的字段造条件 —— 那测的就不是这个字段了。
 > 这种情况通常是**用例本身需要修正**（比如两个字段有关联但用例没写），
 > 你按实际报 FAIL，就是给用例作者提供了修正依据。
+
+### ⚠️ 判定基准只有「预期」：步骤只是执行路径
+
+**用例的「步骤」是走到验证点的路径，「预期」才是要被验证的要求。**
+比较的是**预期与实际**，不是「步骤有没有照做」。
+
+| 情形 | 判 | 为什么 |
+|---|---|---|
+| 步骤照做了，结果与预期不符 | **FAIL** | 验证发生了，结果不符 |
+| 步骤写的做法与实际界面不同，但把页面走到了 | 按**预期**判，不看步骤怎么写的 | 步骤是路径，不是要求 |
+| 步骤的写法比预期更宽松（如步骤写"长按后才出现"，预期写"进入即显示"） | 按**预期**判，不拿步骤给预期松绑 | 预期是要求；两条打架时**以预期为准** |
+| 步骤和预期互相矛盾，走到界面后能明确判出不符 | **FAIL**，并在 actual 里写明这处矛盾 | 不替用例作者调和 |
+
+> ⚠️ **不要用步骤里的一句话去软化预期。** 预期说"进入后就有"，实测"要点一下才有"，
+> 就是**不符 → FAIL**；不能因为步骤里恰好写了"长按"就说"那算通过"。
+> 步骤写错是用例的问题，照实判 FAIL 就是给用例作者提供修正依据。
 
 ### ⚠️ 用例里的预期，**一条没验证到就不能判 PASS**
 
